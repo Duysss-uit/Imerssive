@@ -1,0 +1,6 @@
+app/build/
+worker/.venv/
+worker/.python/
+__pycache__/
+*.pyc
+scene/ 
