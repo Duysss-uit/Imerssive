@@ -69,24 +69,53 @@ func (l *Logs) Model(c llm.Call, level string) {
 	fmt.Fprintf(&b, "Provider : %s · %s (vai trò %s)\n", c.Provider, c.Model, c.Role)
 	fmt.Fprintf(&b, "Thời gian: %s · max_tokens %d\n", c.Duration.Round(time.Millisecond), c.Request.MaxTokens)
 	fmt.Fprintf(&b, "Kết quả  : %s\n", status)
+	if len(c.Request.Tools) > 0 {
+		names := make([]string, len(c.Request.Tools))
+		for i, t := range c.Request.Tools {
+			names[i] = t.Name
+		}
+		last := ""
+		if c.Request.NoMoreTools {
+			last = " (lượt cuối: không được gọi thêm)"
+		}
+		fmt.Fprintf(&b, "Công cụ  : %s%s\n", strings.Join(names, ", "), last)
+	}
 	if level == ModelFull {
 		if c.Request.System != "" {
 			section(&b, "SYSTEM", c.Request.System)
 		}
 		for i, m := range c.Request.Messages {
-			section(&b, fmt.Sprintf("%s #%d", strings.ToUpper(string(m.Role)), i+1), partsText(m.Parts))
+			title := fmt.Sprintf("%s #%d", strings.ToUpper(string(m.Role)), i+1)
+			if m.Role == llm.RoleTool {
+				title = fmt.Sprintf("KẾT QUẢ CÔNG CỤ #%d (%s)", i+1, m.CallID)
+			}
+			section(&b, title, strings.TrimSpace(partsText(m.Parts)+"\n"+callsText(m.Calls)))
 		}
 	}
 	if c.Reasoning != "" {
 		section(&b, fmt.Sprintf("MODEL SUY NGHĨ (%d ký tự)", len([]rune(c.Reasoning))), c.Reasoning)
 	}
-	section(&b, "MODEL TRẢ VỀ", or(c.Response, "(trống)"))
+	if len(c.Calls) > 0 {
+		section(&b, "MODEL GỌI CÔNG CỤ", callsText(c.Calls))
+	}
+	if c.Response != "" || len(c.Calls) == 0 {
+		section(&b, "MODEL TRẢ VỀ", or(c.Response, "(trống)"))
+	}
 	b.WriteString("\n")
 	l.model.Write([]byte(b.String()))
 }
 
 func section(b *strings.Builder, title, body string) {
 	fmt.Fprintf(b, "\n----- %s -----\n%s\n", title, strings.TrimRight(body, "\n"))
+}
+
+// callsText lists tool calls, one per line.
+func callsText(calls []llm.ToolCall) string {
+	var out []string
+	for _, c := range calls {
+		out = append(out, fmt.Sprintf("→ %s(%s) [%s]", c.Name, c.Args, c.ID))
+	}
+	return strings.Join(out, "\n")
 }
 
 // partsText renders message parts, replacing images with a short placeholder.

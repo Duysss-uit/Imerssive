@@ -11,7 +11,7 @@ func TestScenarioCastAndChatMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc := Scenario{Title: "Đêm Thanh Vân", Cast: []CastMember{{Name: "Mai Linh", Description: "Thanh mai trúc mã."}}}
+	sc := Scenario{Title: "Đêm Thanh Vân", Cast: []CastMember{{Name: "Mai Linh", Description: "Thanh mai trúc mã."}}, Quick: true}
 	if err := st.SaveScenario(&sc); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestScenarioCastAndChatMode(t *testing.T) {
 	}
 	defer st.Close()
 	got, err := st.Scenario(sc.ID)
-	if err != nil || len(got.Cast) != 1 || got.Cast[0].Name != "Mai Linh" {
+	if err != nil || len(got.Cast) != 1 || got.Cast[0].Name != "Mai Linh" || !got.Quick {
 		t.Fatalf("cast not round-tripped: %+v %v", got, err)
 	}
 	gotChat, err := st.Chat(ch.ID)

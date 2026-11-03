@@ -1,7 +1,9 @@
 package llm
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -34,6 +36,11 @@ var fallbackModels = map[string]bool{
 }
 
 func (p *anthropicProvider) Stream(ctx context.Context, r Request, onDelta func(string)) (string, error) {
+	t, err := p.Turn(ctx, r, onDelta)
+	return t.Text, err
+}
+
+func (p *anthropicProvider) Turn(ctx context.Context, r Request, onDelta func(string)) (Turn, error) {
 	maxTokens := r.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 64000
@@ -49,6 +56,14 @@ func (p *anthropicProvider) Stream(ctx context.Context, r Request, onDelta func(
 			Text:         r.System,
 			CacheControl: anthropic.NewCacheControlEphemeralParam(),
 		}}
+	}
+	for _, t := range r.Tools {
+		tool := anthropic.ToolUnionParamOfTool(anthropic.ToolInputSchemaParam{Properties: t.Params, Required: t.Required}, t.Name)
+		tool.OfTool.Description = anthropic.String(t.Description)
+		params.Tools = append(params.Tools, tool)
+	}
+	if len(r.Tools) > 0 && r.NoMoreTools {
+		params.ToolChoice = anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}}
 	}
 	if p.cfg.Effort != "" {
 		params.OutputConfig = anthropic.OutputConfigParam{Effort: anthropic.OutputConfigEffort(p.cfg.Effort)}
@@ -69,7 +84,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, r Request, onDelta func(
 	for stream.Next() {
 		ev := stream.Current()
 		if err := msg.Accumulate(ev); err != nil {
-			return text, err
+			return Turn{Text: text}, err
 		}
 		if d, ok := ev.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
 			if td, ok := d.Delta.AsAny().(anthropic.TextDelta); ok {
@@ -80,25 +95,48 @@ func (p *anthropicProvider) Stream(ctx context.Context, r Request, onDelta func(
 			}
 		}
 	}
+	turn := Turn{Text: text}
+	for _, b := range msg.Content {
+		if b.Type == "tool_use" {
+			turn.Calls = append(turn.Calls, ToolCall{ID: b.ID, Name: b.Name, Args: string(b.Input)})
+		}
+	}
 	if err := stream.Err(); err != nil {
-		return text, err
+		return turn, err
 	}
 	if msg.StopReason == anthropic.StopReasonRefusal {
-		return text, fmt.Errorf("%w (%s)", ErrRefusal, msg.StopDetails.Category)
+		return turn, fmt.Errorf("%w (%s)", ErrRefusal, msg.StopDetails.Category)
 	}
-	return text, nil
+	return turn, nil
 }
 
 func toAnthropicMessages(msgs []Message) []anthropic.MessageParam {
 	out := make([]anthropic.MessageParam, 0, len(msgs))
 	for _, m := range msgs {
-		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(m.Parts))
+		if m.Role == RoleTool {
+			// Tool results go back as user content; consecutive results share one message.
+			var text string
+			for _, part := range m.Parts {
+				text += part.Text
+			}
+			block := anthropic.NewToolResultBlock(m.CallID, text, false)
+			if n := len(out); n > 0 && isToolResults(out[n-1]) {
+				out[n-1].OfUser.Content = append(out[n-1].OfUser.Content, block)
+			} else {
+				out = append(out, anthropic.NewUserMessage(block))
+			}
+			continue
+		}
+		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(m.Parts)+len(m.Calls))
 		for _, part := range m.Parts {
 			if part.ImageB64 != "" {
 				blocks = append(blocks, anthropic.NewImageBlockBase64(part.ImageMIME, part.ImageB64))
 			} else if part.Text != "" {
 				blocks = append(blocks, anthropic.NewTextBlock(part.Text))
 			}
+		}
+		for _, c := range m.Calls {
+			blocks = append(blocks, anthropic.NewToolUseBlock(c.ID, json.RawMessage(cmp.Or(c.Args, "{}")), c.Name))
 		}
 		if len(blocks) == 0 {
 			continue
@@ -110,6 +148,18 @@ func toAnthropicMessages(msgs []Message) []anthropic.MessageParam {
 		}
 	}
 	return out
+}
+
+func isToolResults(m anthropic.MessageParam) bool {
+	if m.OfUser == nil || len(m.OfUser.Content) == 0 {
+		return false
+	}
+	for _, b := range m.OfUser.Content {
+		if b.OfToolResult == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *anthropicProvider) ListModels(ctx context.Context) ([]string, error) {

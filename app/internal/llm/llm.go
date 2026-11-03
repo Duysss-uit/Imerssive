@@ -23,8 +23,10 @@ type Part struct {
 }
 
 type Message struct {
-	Role  Role
-	Parts []Part
+	Role   Role
+	Parts  []Part
+	Calls  []ToolCall // assistant: tool calls it made
+	CallID string     // RoleTool: the call this result answers
 }
 
 func TextMessage(role Role, text string) Message {
@@ -38,6 +40,10 @@ type Request struct {
 	Purpose   string // what the call is for; only used in logs
 	// OnReasoning receives a reasoning model's thinking as it streams (may be nil).
 	OnReasoning func(string)
+	// Tools the model may call (providers implementing ToolUser). With
+	// NoMoreTools set the model must answer without calling them.
+	Tools       []Tool
+	NoMoreTools bool
 }
 
 type Provider interface {

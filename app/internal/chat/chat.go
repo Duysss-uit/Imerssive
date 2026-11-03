@@ -147,13 +147,34 @@ func (e *Engine) Regenerate(chatID string) error {
 	if err != nil {
 		return err
 	}
-	if n := len(msgs); n > 1 && msgs[n-1].Role == "assistant" {
+	// A written greeting or opening stays; a narrator opening the model wrote can be redone.
+	if n := len(msgs); n > 0 && msgs[n-1].Role == "assistant" && (n > 1 || e.generatedOpening(chatID)) {
 		if err := e.st.DeleteMessage(msgs[n-1].ID); err != nil {
 			return err
 		}
 	}
 	go e.respond(chatID)
 	return nil
+}
+
+// Begin has the narrator open a scene that has no opening text yet.
+func (e *Engine) Begin(chatID string) error {
+	if msgs, err := e.st.Messages(chatID, true); err != nil || len(msgs) > 0 || e.Busy(chatID) {
+		return err
+	}
+	go e.respond(chatID)
+	return nil
+}
+
+// generatedOpening reports whether a scene's first message came from the model
+// (its scenario has no written opening).
+func (e *Engine) generatedOpening(chatID string) bool {
+	c, err := e.st.Chat(chatID)
+	if err != nil || c.Mode != store.ModeScene {
+		return false
+	}
+	sc, err := e.st.Scenario(c.ScenarioID)
+	return err == nil && sc.Opening == ""
 }
 
 func (e *Engine) respond(chatID string) {
@@ -229,10 +250,14 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 		return "", err
 	}
 
-	// Retrieval query: the latest exchange carries the most signal.
+	// Retrieval query: the latest exchange carries the most signal. Before
+	// anything has been said, look up where the story starts and who the player is.
 	var query string
 	for i := len(history) - 1; i >= 0 && i >= len(history)-2; i-- {
 		query = truncate(history[i].Content, 600) + "\n" + query
+	}
+	if len(history) == 0 && scen != nil {
+		query = strings.TrimSpace(scen.Title + "\n" + truncate(scen.Setting, 600) + "\n" + c.PersonaName + " " + truncate(c.PersonaDesc, 300))
 	}
 
 	var memory string
@@ -264,6 +289,10 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 		}
 		msgs = append(msgs, llm.TextMessage(role, m.Content))
 	}
+	if len(msgs) == 0 || msgs[0].Role != llm.RoleUser {
+		// Some APIs require the conversation to open with a user turn.
+		msgs = append([]llm.Message{llm.TextMessage(llm.RoleUser, "*("+c.PersonaName+" bước vào câu chuyện)*")}, msgs...)
+	}
 	// Attach retrieved context to the final user turn only (it is not persisted).
 	if n := len(msgs); n > 0 && msgs[n-1].Role == llm.RoleUser && (memory != "" || len(images) > 0) {
 		var parts []llm.Part
@@ -275,10 +304,6 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 			parts = append(parts, images...)
 		}
 		msgs[n-1].Parts = append(parts, msgs[n-1].Parts...)
-	}
-	if len(msgs) == 0 || msgs[0].Role != llm.RoleUser {
-		// Some APIs require the conversation to open with a user turn.
-		msgs = append([]llm.Message{llm.TextMessage(llm.RoleUser, "*("+c.PersonaName+" bước vào câu chuyện)*")}, msgs...)
 	}
 
 	e.emit("chat:start", map[string]any{"chatId": chatID})
@@ -402,6 +427,7 @@ Rain hammers the shrine roof as the lanterns gutter out.
 - Each cast member has their own goals, knowledge and voice, and acts on them without waiting for {{user}}. Keep them true to the source: personality, abilities, relationships and the way they talk. A character only knows what they would plausibly know at this point of the story.
 - If {{user}} is a character from the source, everyone treats them as that character (same relationships, history, reputation), but the player decides what they do, and the story may diverge from canon because of it.
 - Characters not listed in the cast may appear when the story calls for it, as long as they fit the source.
+- If nothing has been narrated yet, open the story: set the time, place and situation from the scenario (if it is vague or empty, pick a fitting moment of the source for {{user}}), bring in who is present, and end on a moment that invites {{user}} to act.
 - A <memory> block may precede the player's message: knowledge retrieved from the source work and from earlier in this story. Treat it as canon and stay consistent with it; never mention the block itself. When it doesn't cover something, improvise in a way that fits the canon.
 - Reply in the language the player writes in. Keep the tags exactly as above ([Narrator], [Name]) whatever the language. Keep turns vivid and focused (usually 2-6 blocks) and keep the story moving.
 

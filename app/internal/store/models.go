@@ -73,6 +73,7 @@ type Scenario struct {
 	Opening   string       `json:"opening"`
 	Cast      []CastMember `json:"cast"`
 	KBIDs     []string     `json:"kbIds"`
+	Quick     bool         `json:"quick"` // made by "Chơi ngay" for one scene; hidden from the scenario list
 	CreatedAt int64        `json:"createdAt"`
 }
 

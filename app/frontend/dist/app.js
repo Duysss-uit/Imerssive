@@ -104,6 +104,7 @@ document.addEventListener("click", () => ($("#create-menu").hidden = true));
 $$("#create-menu button").forEach(b => (b.onclick = async () => {
   $("#create-menu").hidden = true;
   const what = b.dataset.create;
+  if (what === "play") { show("scenarios"); quickPlayDialog(); }
   if (what === "character") { show("characters"); editCharacter(); }
   if (what === "scenario") { show("scenarios"); editScenario(); }
   if (what === "kb") { show("library"); editKB(); }
@@ -243,6 +244,23 @@ function resizeImage(file, size) {
   });
 }
 
+// rolePicker lists the roles the player can take: each cast member, or their own character.
+function rolePicker(cast) {
+  return cast.map((m, i) => `<label class="role"><input type="radio" name="role" value="${i}">
+      <div><b>${esc(m.name)}</b><div class="muted small">${esc(m.description)}</div></div></label>`).join("") +
+    `<label class="role"><input type="radio" name="role" value="own" ${cast.length ? "" : "checked"}>
+      <div><b>Tự tạo nhân vật</b><div class="muted small">Một nhân vật mới của riêng bạn bước vào câu chuyện.</div></div></label>`;
+}
+// wireRoles makes picking a cast member fill in the role; "own" clears it for the player to write.
+function wireRoles(body, cast) {
+  $$("input[name=role]", body).forEach(r => (r.onchange = () => {
+    const m = cast[r.value];
+    $("[name=personaName]", body).value = m?.name ?? "";
+    $("[name=personaDesc]", body).value = m?.description ?? "";
+    if (!m) $("[name=personaName]", body).focus();
+  }));
+}
+
 // startChatDialog opens a new conversation. From a character: one-on-one chat
 // (pick a scenario). From a scenario: either play a role in it (a cast member or
 // your own character) with the model narrating everyone else, or chat one-on-one
@@ -261,12 +279,7 @@ async function startChatDialog({ character, scenario }) {
     </div>
     <div id="mode-scene">
       <p class="muted small">Bạn vào vai một nhân vật, AI làm người dẫn truyện và điều khiển thế giới cùng tất cả nhân vật còn lại.</p>
-      <div class="role-list">
-        ${cast.map((m, i) => `<label class="role"><input type="radio" name="role" value="${i}">
-          <div><b>${esc(m.name)}</b><div class="muted small">${esc(m.description)}</div></div></label>`).join("")}
-        <label class="role"><input type="radio" name="role" value="own" ${cast.length ? "" : "checked"}>
-          <div><b>Tự tạo nhân vật</b><div class="muted small">Một nhân vật mới của riêng bạn bước vào bối cảnh này.</div></div></label>
-      </div>
+      <div class="role-list">${rolePicker(cast)}</div>
       <label>Tên nhân vật của bạn<input name="personaName" placeholder="Bạn"></label>
       <label>Mô tả nhân vật của bạn<textarea name="personaDesc" rows="3" placeholder="Ngoại hình, thân phận, năng lực, mục đích khi bước vào câu chuyện…"></textarea></label>
     </div>
@@ -300,13 +313,7 @@ async function startChatDialog({ character, scenario }) {
     $("#mode-scene", body).hidden = mode !== "scene";
     $("#mode-character", body).hidden = mode !== "character";
   }));
-  // Picking a cast member fills in the role; "own" clears it for the player to write.
-  $$("input[name=role]", body).forEach(r => (r.onchange = () => {
-    const m = cast[r.value];
-    $("[name=personaName]", body).value = m?.name ?? "";
-    $("[name=personaDesc]", body).value = m?.description ?? "";
-    if (!m) $("[name=personaName]", body).focus();
-  }));
+  wireRoles(body, cast);
 }
 
 function characterChatDialog(character) {
@@ -325,12 +332,56 @@ function characterChatDialog(character) {
     });
 }
 
+// quickPlayDialog starts a scene straight from the library: pick the work and
+// a role (the cast is every character the work has a profile for) and go. No
+// scenario to write; the narrator opens the story from what it retrieves.
+async function quickPlayDialog(kbIds = []) {
+  if (!state.kbs.length) state.kbs = await api.ListKnowledgeBases();
+  if (!state.kbs.length) return toast("Thêm một bộ truyện ở Thư viện trước", true);
+  await loadProviders();
+  if (!kbIds.length) kbIds = [state.kbs[0].id];
+  let cast = [];
+  const body = openModal(`
+    <h2>▶ Chơi ngay</h2>
+    <p class="muted small">Không cần tạo bối cảnh: chọn truyện và vai, người dẫn truyện tự mở đầu câu chuyện từ dữ liệu trong truyện và điều khiển mọi nhân vật còn lại.</p>
+    <label>Bộ truyện</label>${kbPicker(kbIds)}
+    <label>Bắt đầu từ đâu? (tuỳ chọn)<input name="start" placeholder="Vd: ngày đầu ở trung tâm kiểm tra. Để trống để AI tự chọn"></label>
+    <label>Vai của bạn</label>
+    <div class="role-list" id="qp-roles"></div>
+    <label>Tên nhân vật của bạn<input name="personaName" placeholder="Bạn"></label>
+    <label>Mô tả nhân vật của bạn<textarea name="personaDesc" rows="3" placeholder="Ngoại hình, thân phận, năng lực, mục đích khi bước vào câu chuyện…"></textarea></label>
+    <label>Model<select name="provider">${providerOptions("", "chat")}</select></label>
+    <div class="modal-actions"><button value="cancel">Huỷ</button><button class="primary">Bắt đầu</button></div>`,
+    async fd => {
+      const ids = fd.getAll("kb");
+      if (!ids.length) { toast("Chọn ít nhất một bộ truyện", true); return false; }
+      const name = fd.get("personaName").trim();
+      if (!name) { toast("Chọn một vai hoặc nhập tên nhân vật của bạn", true); return false; }
+      const chat = await api.QuickPlay({ kbIds: ids, start: fd.get("start"), personaName: name,
+        personaDesc: fd.get("personaDesc"), providerId: fd.get("provider") });
+      state.tab = "scenarios";
+      openChat(chat.id);
+    });
+  const roles = $("#qp-roles", body);
+  const loadRoles = async () => {
+    const ids = $$("input[name=kb]:checked", body).map(i => i.value);
+    roles.innerHTML = `<p class="muted small">Đang tải nhân vật…</p>`;
+    cast = ids.length ? await guard(() => api.KBCharacters(ids)) : [];
+    roles.innerHTML = rolePicker(cast);
+    wireRoles(body, cast);
+  };
+  $$("input[name=kb]", body).forEach(i => (i.onchange = loadRoles));
+  loadRoles();
+}
+$("#quick-play").onclick = () => quickPlayDialog();
+
 // ---------- scenarios ----------
 async function loadScenarios() {
   [state.scenarios, state.kbs] = await Promise.all([api.ListScenarios(), api.ListKnowledgeBases()]);
   const list = $("#scenario-list");
-  list.innerHTML = state.scenarios.length ? "" : `<div class="empty">Chưa có bối cảnh. Bấm <b>+ Tạo bối cảnh</b>, nhập ý tưởng, AI sẽ dựng bối cảnh và trích xuất các nhân vật trong truyện để bạn chọn vai.</div>`;
-  for (const s of state.scenarios) {
+  const saved = state.scenarios.filter(s => !s.quick); // "Chơi ngay" scenes live in the chat list only
+  list.innerHTML = saved.length ? "" : `<div class="empty">Chưa có bối cảnh lưu sẵn. Bấm <b>▶ Chơi ngay</b> để vào truyện luôn, hoặc <b>+ Tạo bối cảnh</b> để soạn một cảnh và chơi lại nhiều lần.</div>`;
+  for (const s of saved) {
     const card = document.createElement("div");
     card.className = "ccard";
     card.append(avatarEl({ name: s.title }, "ccard-img ccard-scene"));
@@ -464,7 +515,7 @@ async function renderKB(kb) {
   d.innerHTML = `
     <div class="card">
       <div class="card-head"><h2>${esc(kb.name)}</h2>
-        <div><button id="kb-edit">Sửa</button> <button id="kb-del" class="danger ghost">Xoá</button></div></div>
+        <div><button id="kb-play" class="primary">▶ Chơi ngay</button> <button id="kb-edit">Sửa</button> <button id="kb-del" class="danger ghost">Xoá</button></div></div>
       <div class="gen-row">
         <select id="comic-mode" style="flex:1;max-width:none">
           <option value="vision">Truyện tranh: đọc bằng vision LLM (chính xác, tốn token 1 lần)</option>
@@ -538,6 +589,7 @@ async function renderKB(kb) {
     toast(`Đã thêm ${paths.length} tài liệu vào hàng đợi`);
     renderKB(kb);
   };
+  $("#kb-play", d).onclick = () => quickPlayDialog([kb.id]);
   $("#kb-edit", d).onclick = () => editKB(kb);
   $("#kb-del", d).onclick = () => openModal(`<h2>Xoá “${esc(kb.name)}”?</h2><p class="muted">Toàn bộ tài liệu và vector của bộ truyện này sẽ bị xoá.</p>
     <div class="modal-actions"><button value="cancel">Huỷ</button><button class="primary">Xoá</button></div>`,

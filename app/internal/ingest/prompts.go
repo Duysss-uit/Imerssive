@@ -37,24 +37,24 @@ Use exactly this format, one block per page, in the language of the dialogue:
 === PAGE <number> ===
 <content>`
 
-const characterPrompt = `Using the knowledge below about the work, create a roleplay character card for "%s".
+// The generation prompts below describe the task only. The knowledge comes
+// separately: a brief (overview + names) and whatever the model looks up with
+// the search_story tool, or a <knowledge> block when tools aren't available.
+
+const characterPrompt = `Create a roleplay character card for "%s" from the work.
 %s
 Return ONLY a JSON object with these string fields:
 {"name": "", "tagline": "one-line hook", "description": "who they are, appearance, background, situation (two short paragraphs)",
  "personality": "traits, values, fears, quirks (one paragraph)", "speakingStyle": "how they talk: tone, verbal tics, forms of address, sample phrases",
  "greeting": "the first message they send to start a roleplay, in character, a few sentences, with *actions* in asterisks",
  "exampleDialogue": "3-4 short exchanges formatted as {{user}}: ... / {{char}}: ..."}
-Stay faithful to the source. Write in the same language as the knowledge.
-
-<knowledge>
-%s
-</knowledge>`
+Stay faithful to the source. Write in the same language as the work.`
 
 const castFields = `"cast": [{"name": "exact name as in the source", "description": "who they are, appearance, personality, abilities, how they speak, their goal and state of mind in this scene, relationships to the others (one short paragraph)"}]`
 
-const castRules = `cast: 3-8 characters from the work who are present in or plausibly drawn into this scene, most important first. Use only characters that exist in the knowledge; never invent new ones. The player may choose to play any of them, so describe each from a neutral point of view.`
+const castRules = `cast: 3-8 characters from the work who are present in or plausibly drawn into this scene, most important first. Use only characters that exist in the work; never invent new ones. The player may choose to play any of them, so describe each from a neutral point of view.`
 
-const scenarioPrompt = `Using the knowledge below about the work, create a roleplay scenario (setting) for the player to step into.
+const scenarioPrompt = `Create a roleplay scenario (setting) from the work for the player to step into.
 %s
 Return ONLY a JSON object:
 {"title": "", "setting": "time, place, situation, what is at stake, relevant world rules (one or two paragraphs)",
@@ -62,13 +62,9 @@ Return ONLY a JSON object:
  ` + castFields + `}
 - opening: the player will pick their role only after this is written, so don't assume who they are: describe the scene and the cast, then end on a moment that invites action.
 - ` + castRules + `
-Stay consistent with the source. Write in the same language as the knowledge.
+Stay consistent with the source. Write in the same language as the work.`
 
-<knowledge>
-%s
-</knowledge>`
-
-const castPrompt = `Using the knowledge below about the work, list the characters for this roleplay scenario.
+const castPrompt = `List the characters from the work for this roleplay scenario.
 
 <scenario title=%q>
 %s
@@ -77,7 +73,28 @@ const castPrompt = `Using the knowledge below about the work, list the character
 Return ONLY a JSON object:
 {` + castFields + `}
 - ` + castRules + `
-Write in the same language as the knowledge.
+Write in the same language as the work.`
+
+// researchNote follows the task when the model can search the work itself.
+const researchNote = `<brief>
+%s
+</brief>
+
+The brief is only an outline of the work. Before answering, use the search_story tool to look up the specific details this task needs (characters, places, events, relationships), at most %d searches, then return the JSON.`
+
+// planPrompt asks for search queries when the model can't call tools.
+const planPrompt = `%s
+
+<brief>
+%s
+</brief>
+
+Before doing this task you may look things up in the work. Return ONLY a JSON array of at most %d short search queries (names, places, events, relationships) that would give you the details you need, in the language of the work.`
+
+// knowledgeNote follows the task with the knowledge found for it.
+const knowledgeNote = `<brief>
+%s
+</brief>
 
 <knowledge>
 %s

@@ -12,6 +12,7 @@
     <div class="create-wrap">
       <button class="create-btn" id="create-btn"><span class="plus">+</span> Tạo</button>
       <div id="create-menu" class="menu" hidden>
+        <button data-create="play">▶ Chơi ngay</button>
         <button data-create="character">Nhân vật</button>
         <button data-create="scenario">Bối cảnh</button>
         <button data-create="kb">Bộ truyện</button>
@@ -61,7 +62,7 @@
           <div class="muted">Nơi và lúc câu chuyện diễn ra</div>
           <h1>Bối cảnh</h1>
         </div>
-        <button class="primary" id="new-scenario">+ Tạo bối cảnh</button>
+        <div><button class="primary" id="quick-play">▶ Chơi ngay</button> <button id="new-scenario">+ Tạo bối cảnh</button></div>
       </header>
       <div id="scenario-list" class="cards"></div>
     </section>

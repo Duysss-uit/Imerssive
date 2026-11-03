@@ -39,6 +39,7 @@ type Service struct {
 	st       *store.Store
 	w        *worker.Manager
 	rag      *rag.Store
+	lookup   lookup // what generation reads from the vector store (s.rag; swapped in tests)
 	spaces   rag.Spaces
 	resolve  llm.Resolver
 	opts     func() Options
@@ -55,6 +56,7 @@ func New(st *store.Store, w *worker.Manager, r *rag.Store, spaces rag.Spaces, re
 	srcDir, pagesDir string, emit func(string, any)) *Service {
 	s := &Service{st: st, w: w, rag: r, spaces: spaces, resolve: resolve, opts: opts, srcDir: srcDir, pagesDir: pagesDir,
 		emit: emit, queue: make(chan string, 256), cancels: map[string]context.CancelFunc{}}
+	s.lookup = r
 	go s.loop()
 	return s
 }

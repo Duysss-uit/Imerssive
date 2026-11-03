@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -473,7 +475,7 @@ func (a *App) DeleteCharacter(id string) error {
 
 // GenerateCharacter drafts a card with providerID (empty = summarize role).
 func (a *App) GenerateCharacter(kbIDs []string, name, hint, providerID string) (store.Character, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	c, err := a.ingest.GenerateCharacter(ctx, kbIDs, name, hint, providerID)
 	return c, act(err, "character: AI tạo thẻ %q", name)
@@ -491,7 +493,7 @@ func (a *App) DeleteScenario(id string) error {
 }
 
 func (a *App) GenerateScenario(kbIDs []string, hint, providerID string) (store.Scenario, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	s, err := a.ingest.GenerateScenario(ctx, kbIDs, hint, providerID)
 	return s, act(err, "scenario: AI tạo bối cảnh %q (%d nhân vật) từ ý tưởng %q", s.Title, len(s.Cast), hint)
@@ -499,7 +501,7 @@ func (a *App) GenerateScenario(kbIDs []string, hint, providerID string) (store.S
 
 // ExtractCast lists source characters who fit a user-written scenario.
 func (a *App) ExtractCast(kbIDs []string, title, setting, providerID string) ([]store.CastMember, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	cast, err := a.ingest.ExtractCast(ctx, kbIDs, title, setting, providerID)
 	return cast, act(err, "scenario: AI trích xuất %d nhân vật cho %q", len(cast), title)
@@ -511,7 +513,62 @@ func (a *App) ListChats() ([]store.Chat, error) { return a.st.Chats() }
 
 func (a *App) CreateChat(c store.Chat) (store.Chat, error) {
 	err := a.chat.Create(&c)
+	if err == nil && c.Mode == store.ModeScene {
+		err = a.chat.Begin(c.ID) // no written opening: the narrator opens
+	}
 	return c, act(err, "chat: tạo %q (chế độ %s, vai %q)", c.Title, or(c.Mode, "nhân vật"), c.PersonaName)
+}
+
+// KBCharacters lists the characters profiled in the knowledge bases, ready to
+// play or to be played against (no model call: the profiles came from ingest).
+func (a *App) KBCharacters(kbIDs []string) ([]store.CastMember, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	ents, err := a.ingest.Entities(ctx, kbIDs)
+	out := []store.CastMember{}
+	for _, e := range ents {
+		if e.IsCharacter() {
+			out = append(out, store.CastMember{Name: e.Name, Description: ingest.Shorten(e.Profile, 600)})
+		}
+	}
+	return out, err
+}
+
+type QuickPlayInput struct {
+	KBIDs       []string `json:"kbIds"`
+	Start       string   `json:"start"` // where to begin, in the player's words; may be empty
+	PersonaName string   `json:"personaName"`
+	PersonaDesc string   `json:"personaDesc"`
+	ProviderID  string   `json:"providerId"`
+}
+
+// QuickPlay starts a scene straight from knowledge bases: no scenario to write
+// or generate. The cast is every profiled character and the narrator opens
+// the story itself, retrieving what it needs.
+func (a *App) QuickPlay(in QuickPlayInput) (store.Chat, error) {
+	if len(in.KBIDs) == 0 {
+		return store.Chat{}, errors.New("chọn ít nhất một bộ truyện")
+	}
+	cast, err := a.KBCharacters(in.KBIDs)
+	if err != nil {
+		return store.Chat{}, err
+	}
+	var names []string
+	for _, id := range in.KBIDs {
+		if kb, err := a.st.KnowledgeBase(id); err == nil {
+			names = append(names, kb.Name)
+		}
+	}
+	title := strings.Join(names, " + ")
+	if s := strings.TrimSpace(in.Start); s != "" {
+		title += " · " + ingest.Shorten(s, 40)
+	}
+	sc := store.Scenario{Title: title, Setting: strings.TrimSpace(in.Start), KBIDs: in.KBIDs, Cast: cast[:min(len(cast), 12)], Quick: true}
+	if err := a.st.SaveScenario(&sc); err != nil {
+		return store.Chat{}, err
+	}
+	return a.CreateChat(store.Chat{Mode: store.ModeScene, ScenarioID: sc.ID, ProviderID: in.ProviderID,
+		PersonaName: in.PersonaName, PersonaDesc: in.PersonaDesc})
 }
 
 func (a *App) UpdateChat(c store.Chat) error { return a.st.SaveChat(&c) }
@@ -522,7 +579,18 @@ func (a *App) SetChatProvider(chatID, providerID string) error {
 }
 
 func (a *App) DeleteChat(id string) error {
-	return act(a.chat.Delete(context.Background(), id), "chat: xoá %s", id)
+	c, _ := a.st.Chat(id)
+	if err := act(a.chat.Delete(context.Background(), id), "chat: xoá %s", id); err != nil {
+		return err
+	}
+	// A "Chơi ngay" scenario exists only for its chats.
+	if sc, err := a.st.Scenario(c.ScenarioID); err == nil && sc.Quick {
+		chats, _ := a.st.Chats()
+		if !slices.ContainsFunc(chats, func(x store.Chat) bool { return x.ScenarioID == sc.ID }) {
+			a.st.DeleteScenario(sc.ID)
+		}
+	}
+	return nil
 }
 
 func (a *App) GetMessages(chatID string) ([]store.Message, error) {

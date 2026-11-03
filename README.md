@@ -79,9 +79,10 @@ Lần đầu xử lý tài liệu, app sẽ tải model embedding (khoảng 220 
    - `both`: làm cả hai.
    Ở thẻ **Model xử lý & embedding** của từng bộ truyện, có thể chọn model tóm tắt, model vision, và embedding: local (fastembed, miễn phí) hoặc qua API (OpenAI, OpenRouter, NVIDIA, Ollama/LM Studio). Đổi embedding thì app tự embedding lại văn bản đã lưu, không gọi lại LLM.
 4. Dùng ô **Thử truy xuất RAG** để xem model sẽ “nhớ” được gì.
-5. **Nhân vật / Bối cảnh:** chọn bộ truyện, nhập tên, chọn model rồi bấm ✨ Tạo. AI dựng thẻ nhân vật từ hồ sơ trong RAG, sau đó bạn sửa lại rồi lưu.
+5. **Nhân vật / Bối cảnh:** chọn bộ truyện, nhập tên, chọn model rồi bấm ✨ Tạo. Model chỉ nhận tổng quan ngắn và danh sách tên có trong truyện, rồi **tự tìm trong RAG** những gì nó cần bằng công cụ `search_story` (tối đa 5 lần tìm; các lần tìm được ghi trong model log). Model không gọi được công cụ thì liệt kê trước những gì cần tìm, app tìm giúp rồi đưa kết quả cho model. Sau đó bạn sửa lại rồi lưu.
 6. Bấm vào thẻ nhân vật để tiếp tục cuộc trò chuyện gần nhất (hoặc bắt đầu mới). Model của từng cuộc trò chuyện đổi được ở góc trên bên phải màn hình chat; nút ⋯ mở thông tin nhân vật, lịch sử và “Chat mới”.
 7. **Hoá thân vào truyện:** ở tab Bối cảnh, nhập ý tưởng rồi bấm ✨ Tạo. AI dựng bối cảnh và trích xuất các nhân vật có mặt từ bộ truyện (nếu tự viết bối cảnh thì bấm “✨ Trích xuất từ truyện”). Bấm “Lưu & nhập vai”, rồi chọn vào vai một nhân vật trong danh sách hoặc tự tạo nhân vật. AI làm người dẫn truyện, điều khiển thế giới và mọi nhân vật còn lại. Vẫn có thể chọn “Chat với một nhân vật” để chat 1-1 trong bối cảnh đó.
+8. **Chơi ngay:** nút ▶ Chơi ngay (trong Thư viện, tab Bối cảnh hoặc menu + Tạo) đưa bạn vào truyện mà không cần tạo bối cảnh. Chọn bộ truyện, có thể gõ một dòng muốn bắt đầu từ đâu, rồi chọn vai từ danh sách nhân vật đã có sẵn trong hồ sơ của bộ truyện (không gọi model) hoặc tự tạo nhân vật. Người dẫn truyện tự viết đoạn mở đầu từ dữ liệu trong truyện.
 
 ## Dữ liệu
 

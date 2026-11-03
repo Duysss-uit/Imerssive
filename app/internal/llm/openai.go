@@ -57,6 +57,11 @@ func (p *openAICompat) newRequest(ctx context.Context, method, path string, body
 }
 
 func (p *openAICompat) Stream(ctx context.Context, r Request, onDelta func(string)) (string, error) {
+	t, err := p.Turn(ctx, r, onDelta)
+	return t.Text, err
+}
+
+func (p *openAICompat) Turn(ctx context.Context, r Request, onDelta func(string)) (Turn, error) {
 	msgs := make([]map[string]any, 0, len(r.Messages)+1)
 	system := r.System
 	if p.cfg.NoThinking && p.cfg.Kind == KindLocal {
@@ -66,9 +71,34 @@ func (p *openAICompat) Stream(ctx context.Context, r Request, onDelta func(strin
 		msgs = append(msgs, map[string]any{"role": "system", "content": system})
 	}
 	for _, m := range r.Messages {
-		msgs = append(msgs, map[string]any{"role": string(m.Role), "content": encodeParts(m.Parts)})
+		msg := map[string]any{"role": string(m.Role), "content": encodeParts(m.Parts)}
+		if m.Role == RoleTool {
+			msg["tool_call_id"] = m.CallID
+		}
+		if len(m.Calls) > 0 {
+			calls := make([]map[string]any, len(m.Calls))
+			for i, c := range m.Calls {
+				calls[i] = map[string]any{"id": c.ID, "type": "function",
+					"function": map[string]any{"name": c.Name, "arguments": c.Args}}
+			}
+			msg["tool_calls"] = calls
+		}
+		msgs = append(msgs, msg)
 	}
 	body := map[string]any{"model": p.cfg.Model, "messages": msgs, "stream": true}
+	if len(r.Tools) > 0 {
+		tools := make([]map[string]any, len(r.Tools))
+		for i, t := range r.Tools {
+			tools[i] = map[string]any{"type": "function", "function": map[string]any{
+				"name": t.Name, "description": t.Description,
+				"parameters": map[string]any{"type": "object", "properties": t.Params, "required": t.Required},
+			}}
+		}
+		body["tools"] = tools
+		if r.NoMoreTools {
+			body["tool_choice"] = "none"
+		}
+	}
 	if p.cfg.Temperature > 0 {
 		body["temperature"] = p.cfg.Temperature
 	}
@@ -93,6 +123,9 @@ func (p *openAICompat) Stream(ctx context.Context, r Request, onDelta func(strin
 	}
 
 	resp, err := p.post(ctx, body)
+	if e := (*statusError)(nil); len(r.Tools) > 0 && errors.As(err, &e) && e.code/100 == 4 && strings.Contains(strings.ToLower(e.body), "tool") {
+		return Turn{}, fmt.Errorf("%w: %v", ErrNoTools, err)
+	}
 	// A 400 about an optional field (token budget above this model's limit, or a
 	// thinking switch it doesn't know): drop the optional fields and try once more.
 	if e := (*statusError)(nil); errors.As(err, &e) && e.code == http.StatusBadRequest &&
@@ -103,9 +136,23 @@ func (p *openAICompat) Stream(ctx context.Context, r Request, onDelta func(strin
 		resp, err = p.post(ctx, body)
 	}
 	if err != nil {
-		return "", err
+		return Turn{}, err
 	}
 	defer resp.Body.Close()
+
+	// Tool calls stream in pieces keyed by index: id and name first, then the
+	// JSON arguments a fragment at a time.
+	var calls []ToolCall
+	addCall := func(i int, id, name, args string) {
+		for len(calls) <= i {
+			calls = append(calls, ToolCall{})
+		}
+		if id != "" {
+			calls[i].ID = id
+		}
+		calls[i].Name += name
+		calls[i].Args += args
+	}
 
 	// Reasoning models send their thinking apart from the answer: in a
 	// reasoning_content / reasoning field (NVIDIA, LM Studio, OpenRouter...) or
@@ -145,6 +192,14 @@ func (p *openAICompat) Stream(ctx context.Context, r Request, onDelta func(strin
 					Content          string `json:"content"`
 					ReasoningContent string `json:"reasoning_content"`
 					Reasoning        string `json:"reasoning"`
+					ToolCalls        []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
@@ -156,35 +211,56 @@ func (p *openAICompat) Stream(ctx context.Context, r Request, onDelta func(strin
 			continue
 		}
 		if chunk.Error != nil {
-			return out.String(), fmt.Errorf("%s: %s", p.cfg.Kind, chunk.Error.Message)
+			return Turn{Text: out.String()}, fmt.Errorf("%s: %s", p.cfg.Kind, chunk.Error.Message)
 		}
 		for _, c := range chunk.Choices {
 			emit("", c.Delta.ReasoningContent+c.Delta.Reasoning)
 			emit(think.feed(c.Delta.Content))
+			for _, tc := range c.Delta.ToolCalls {
+				addCall(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+			}
 			if c.FinishReason != "" {
 				finish = c.FinishReason
 			}
 			if c.FinishReason == "content_filter" {
-				return out.String(), ErrRefusal
+				return Turn{Text: out.String()}, ErrRefusal
 			}
 		}
 	}
 	emit(think.flush())
-	if err := sc.Err(); err != nil {
-		return out.String(), err
+	turn := Turn{Text: out.String()}
+	for i, c := range calls {
+		if c.Name == "" {
+			continue
+		}
+		if c.ID == "" {
+			c.ID = fmt.Sprintf("call_%d", i)
+		}
+		turn.Calls = append(turn.Calls, c)
 	}
-	if strings.TrimSpace(out.String()) == "" && thinking > 0 {
+	if err := sc.Err(); err != nil {
+		return turn, err
+	}
+	if len(turn.Calls) > 0 {
+		return turn, nil
+	}
+	return turn, emptyAnswer(turn.Text, thinking, finish, r.MaxTokens)
+}
+
+// emptyAnswer explains a reply that holds only thinking, or returns nil.
+func emptyAnswer(text string, thinking int, finish string, maxTokens int) error {
+	if strings.TrimSpace(text) == "" && thinking > 0 {
 		if finish == "length" {
 			// "length" also means the context window filled up (prompt + output),
 			// which local servers load small by default. ~3 chars per token.
-			if used := thinking / 3; r.MaxTokens == 0 || used < r.MaxTokens*2/3 {
-				return "", fmt.Errorf("model bị cắt sau khoảng %d token suy nghĩ, còn xa giới hạn max_tokens: nhiều khả năng ngữ cảnh (context length) của model đã đầy vì prompt dài. Với LM Studio/Ollama, nạp lại model với Context Length lớn hơn (từ 16384 trở lên), hoặc bật “Tắt suy nghĩ” cho provider này trong Cài đặt", used)
+			if used := thinking / 3; maxTokens == 0 || used < maxTokens*2/3 {
+				return fmt.Errorf("model bị cắt sau khoảng %d token suy nghĩ, còn xa giới hạn max_tokens: nhiều khả năng ngữ cảnh (context length) của model đã đầy vì prompt dài. Với LM Studio/Ollama, nạp lại model với Context Length lớn hơn (từ 16384 trở lên), hoặc bật “Tắt suy nghĩ” cho provider này trong Cài đặt", used)
 			}
-			return "", fmt.Errorf("model dùng hết %d token cho phần suy nghĩ (%d ký tự) nên chưa kịp trả lời: bật “Tắt suy nghĩ” cho provider này trong Cài đặt, hoặc tăng max tokens", r.MaxTokens, thinking)
+			return fmt.Errorf("model dùng hết %d token cho phần suy nghĩ (%d ký tự) nên chưa kịp trả lời: bật “Tắt suy nghĩ” cho provider này trong Cài đặt, hoặc tăng max tokens", maxTokens, thinking)
 		}
-		return "", fmt.Errorf("model chỉ trả về phần suy nghĩ (%d ký tự), không có câu trả lời", thinking)
+		return fmt.Errorf("model chỉ trả về phần suy nghĩ (%d ký tự), không có câu trả lời", thinking)
 	}
-	return out.String(), nil
+	return nil
 }
 
 type statusError struct {

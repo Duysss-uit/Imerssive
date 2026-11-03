@@ -50,6 +50,7 @@ var migrations = []string{
 	`ALTER TABLE chats ADD COLUMN mode TEXT DEFAULT ''`,
 	`ALTER TABLE scenarios ADD COLUMN cast_json TEXT DEFAULT '[]'`,
 	`ALTER TABLE providers ADD COLUMN thinking TEXT DEFAULT ''`,
+	`ALTER TABLE scenarios ADD COLUMN quick INTEGER DEFAULT 0`,
 }
 
 func Open(path string) (*Store, error) {
@@ -355,12 +356,14 @@ func (s *Store) DeleteCharacter(id string) error {
 
 // ---- scenarios ----
 
-const scenarioCols = `id,title,setting,opening,kb_ids,cast_json,created_at`
+const scenarioCols = `id,title,setting,opening,kb_ids,cast_json,quick,created_at`
 
 func scanScenario(sc interface{ Scan(...any) error }) (Scenario, error) {
 	var x Scenario
 	var kb, cast string
-	err := sc.Scan(&x.ID, &x.Title, &x.Setting, &x.Opening, &kb, &cast, &x.CreatedAt)
+	var quick int
+	err := sc.Scan(&x.ID, &x.Title, &x.Setting, &x.Opening, &kb, &cast, &quick, &x.CreatedAt)
+	x.Quick = quick != 0
 	x.KBIDs = decodeIDs(kb)
 	json.Unmarshal([]byte(cast), &x.Cast)
 	if x.Cast == nil {
@@ -399,10 +402,10 @@ func (s *Store) SaveScenario(x *Scenario) error {
 		x.Cast = []CastMember{}
 	}
 	cast, _ := json.Marshal(x.Cast)
-	_, err := s.db.Exec(`INSERT INTO scenarios(`+scenarioCols+`) VALUES(?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO scenarios(`+scenarioCols+`) VALUES(?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET title=excluded.title, setting=excluded.setting, opening=excluded.opening,
-		kb_ids=excluded.kb_ids, cast_json=excluded.cast_json`,
-		x.ID, x.Title, x.Setting, x.Opening, encodeIDs(x.KBIDs), string(cast), x.CreatedAt)
+		kb_ids=excluded.kb_ids, cast_json=excluded.cast_json, quick=excluded.quick`,
+		x.ID, x.Title, x.Setting, x.Opening, encodeIDs(x.KBIDs), string(cast), b2i(x.Quick), x.CreatedAt)
 	return err
 }
 
