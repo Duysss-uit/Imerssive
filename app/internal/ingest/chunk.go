@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"immersive/internal/lore"
 )
 
-// unit is the text of one page (or one vision-described comic page).
-type unit struct {
-	Page int // 1-based
-	Text string
-}
+// unit is the text of one page (or one vision-transcribed comic page).
+type unit = lore.Page
 
 // span is a contiguous piece of text with the page range it came from.
 type span struct {

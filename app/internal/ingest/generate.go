@@ -6,106 +6,49 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"immersive/internal/llm"
+	"immersive/internal/lore"
+	"immersive/internal/prompts"
 	"immersive/internal/rag"
 	"immersive/internal/store"
 )
 
 // Generation doesn't stuff the prompt with retrieved text. The model gets a
-// brief (overview + the names the work knows) and looks up what it needs with
-// the search_story tool. Models without tool calling first list their queries,
+// brief (the story map + the names the work knows) and looks up what it needs
+// with the lore tools. Models without tool calling first list their queries,
 // then get the results in one block.
 const (
-	briefOverviewChars = 3000  // overview per knowledge base in the brief
-	briefNames         = 80    // entity names listed in the brief
-	searchResultChars  = 5000  // one search_story result
-	maxSearches        = 5     // searches per generation
-	plannedChars       = 12000 // all results together, without tools
+	briefNames  = 80 // entity names listed in the brief
+	maxSearches = 5  // lookups per generation
 )
 
-// lookup is the part of the vector store generation needs.
-type lookup interface {
-	SearchKBs(ctx context.Context, spaces rag.Spaces, query string, f rag.Filter, k int) ([]rag.Hit, error)
-	GetTexts(ctx context.Context, sp rag.Space, f rag.Filter, limit int) ([]rag.Hit, error)
-}
-
-var searchTool = llm.Tool{
-	Name: "search_story",
-	Description: "Search the work's knowledge base: character profiles, chapter summaries and original passages. " +
-		"Use one focused query per call: a name, a place, an event, a relationship.",
-	Params:   map[string]any{"query": map[string]any{"type": "string", "description": "what to look up, in the work's language"}},
-	Required: []string{"query"},
-}
-
 // Entity is one profile the ingest pipeline built (character, place, faction...).
-type Entity struct {
-	Name, Type, Profile string
-}
+type Entity = lore.Entity
 
 // Entities lists the profiles stored for the knowledge bases.
 func (s *Service) Entities(ctx context.Context, kbIDs []string) ([]Entity, error) {
-	var out []Entity
-	for _, id := range kbIDs {
-		sp, err := s.spaces(id)
-		if err != nil {
-			return nil, err
-		}
-		hits, err := s.lookup.GetTexts(ctx, sp, rag.Filter{KBIDs: []string{id}, Levels: []string{rag.LevelEntity}}, 1000)
-		if err != nil {
-			return nil, err
-		}
-		for _, h := range hits {
-			out = append(out, parseEntity(h.Str("name"), h.Text))
-		}
-	}
-	return out, nil
+	return s.lore.Entities(ctx, kbIDs)
 }
 
-// parseEntity splits a stored profile "Name (type): profile".
-func parseEntity(name, text string) Entity {
-	e := Entity{Name: name, Profile: text}
-	if head, rest, ok := strings.Cut(text, ": "); ok && strings.HasSuffix(head, ")") {
-		if i := strings.LastIndex(head, " ("); i > 0 {
-			e.Type = head[i+2 : len(head)-1]
-			e.Profile = rest
-			if e.Name == "" {
-				e.Name = head[:i]
-			}
-		}
-	}
-	return e
-}
-
-// IsCharacter reports whether the profile is about a person (types come from the model, in any language).
-func (e Entity) IsCharacter() bool {
-	t := strings.ToLower(e.Type)
-	return strings.Contains(t, "character") || strings.Contains(t, "nhân vật") || strings.Contains(t, "person")
-}
-
-// brief outlines the work: overviews and the names of everything profiled.
-func (s *Service) brief(ctx context.Context, kbIDs []string) string {
-	var parts []string
-	for _, id := range kbIDs {
-		if kb, err := s.st.KnowledgeBase(id); err == nil && kb.Overview != "" {
-			parts = append(parts, "[Tổng quan: "+kb.Name+"]\n"+headRunes(kb.Overview, briefOverviewChars))
-		}
-	}
+// brief outlines the work in about maxChars: the story map and the names of
+// everything profiled.
+func (s *Service) brief(ctx context.Context, kbIDs []string, maxChars int) string {
+	var names string
 	if ents, err := s.Entities(ctx, kbIDs); err == nil && len(ents) > 0 {
-		var names []string
+		var list []string
 		for _, e := range ents[:min(len(ents), briefNames)] {
-			names = append(names, fmt.Sprintf("%s (%s)", e.Name, e.Type))
+			list = append(list, fmt.Sprintf("%s (%s)", e.Name, e.Type))
 		}
-		parts = append(parts, "[Có hồ sơ trong truyện]\n"+strings.Join(names, ", "))
+		names = "[Có hồ sơ trong truyện]\n" + strings.Join(list, ", ")
 	}
-	return strings.Join(parts, "\n\n")
-}
-
-// search answers one query against the knowledge bases.
-func (s *Service) search(ctx context.Context, kbIDs []string, query string, k int) ([]rag.Hit, error) {
-	return s.lookup.SearchKBs(ctx, s.spaces, query, rag.Filter{KBIDs: kbIDs,
-		Levels: []string{rag.LevelEntity, rag.LevelSection, rag.LevelRaw}}, k)
+	m := s.lore.Map(kbIDs, max(maxChars-len([]rune(names)), maxChars/2))
+	if m != "" {
+		m = "[Bản đồ truyện]\n" + m
+	}
+	return strings.TrimSpace(m + "\n\n" + names)
 }
 
 // research runs task with the model looking up what it needs, and returns its final answer.
@@ -115,16 +58,19 @@ func (s *Service) research(ctx context.Context, kbIDs []string, providerID, purp
 	if err != nil {
 		return "", err
 	}
-	brief := strings.TrimSpace(s.brief(ctx, kbIDs) + "\n\n" + extra)
-	msgs := []llm.Message{llm.TextMessage(llm.RoleUser, task+"\n\n"+fmt.Sprintf(researchNote, brief, maxSearches))}
+	maxOut, inChars := llm.Budget(p, 10000)
+	// The brief takes a quarter of the room; each lookup an equal share of the rest.
+	brief := strings.TrimSpace(s.brief(ctx, kbIDs, inChars/4) + "\n\n" + headRunes(extra, inChars/8))
+	resultChars := max((inChars-len([]rune(brief))-len([]rune(task))-2000)/(maxSearches+1), 800)
+	msgs := []llm.Message{llm.TextMessage(llm.RoleUser, task+"\n\n"+prompts.Get("research-tools", "brief", brief, "max", strconv.Itoa(maxSearches)))}
 	searches := 0
 	for turnNo := 1; ; turnNo++ {
 		last := searches >= maxSearches
 		turn, err := llm.RunTurn(ctx, p, llm.Request{Purpose: fmt.Sprintf("%s · lượt %d", purpose, turnNo),
-			System: analystSystem, MaxTokens: 10000, Messages: msgs, Tools: []llm.Tool{searchTool}, NoMoreTools: last})
+			System: prompts.Get("analyst-system"), MaxTokens: maxOut, Messages: msgs, Tools: lore.Tools, NoMoreTools: last})
 		if errors.Is(err, llm.ErrNoTools) {
 			log.Printf("research: %s: model không gọi được công cụ, chuyển sang tìm theo kế hoạch", purpose)
-			return s.researchPlanned(ctx, p, kbIDs, purpose, task, brief)
+			return s.researchPlanned(ctx, p, maxOut, inChars, kbIDs, purpose, task, brief)
 		}
 		if err != nil {
 			return "", err
@@ -138,40 +84,22 @@ func (s *Service) research(ctx context.Context, kbIDs []string, providerID, purp
 		}
 		msgs = append(msgs, reply)
 		for _, c := range turn.Calls {
-			result := "Đã hết lượt tìm. Hãy viết kết quả từ những gì đã có."
+			result := "Đã hết lượt tra cứu. Hãy viết kết quả từ những gì đã có."
 			if searches < maxSearches {
 				searches++
-				result = s.runSearch(ctx, kbIDs, c)
+				result = s.lore.Run(ctx, kbIDs, c, resultChars)
+				log.Printf("research: %s %s → %d ký tự", c.Name, c.Args, len([]rune(result)))
 			}
 			msgs = append(msgs, llm.Message{Role: llm.RoleTool, CallID: c.ID, Parts: []llm.Part{{Text: result}}})
 		}
 	}
 }
 
-// runSearch executes one search_story call and formats the result for the model.
-func (s *Service) runSearch(ctx context.Context, kbIDs []string, c llm.ToolCall) string {
-	var args struct {
-		Query string `json:"query"`
-	}
-	if c.Name != searchTool.Name || json.Unmarshal([]byte(c.Args), &args) != nil || strings.TrimSpace(args.Query) == "" {
-		return `Lỗi: gọi search_story với {"query": "..."}.`
-	}
-	hits, err := s.search(ctx, kbIDs, args.Query, 6)
-	log.Printf("research: tìm %q → %d kết quả", args.Query, len(hits))
-	if err != nil {
-		return "Lỗi khi tìm: " + err.Error()
-	}
-	if len(hits) == 0 {
-		return "Không tìm thấy gì cho câu hỏi này."
-	}
-	return rag.FormatContext(hits, searchResultChars)
-}
-
 // researchPlanned is research for models without tool calling: they list
 // their queries first, then answer with all the results at once.
-func (s *Service) researchPlanned(ctx context.Context, p llm.Provider, kbIDs []string, purpose, task, brief string) (string, error) {
-	plan, err := llm.Complete(ctx, p, llm.Request{Purpose: purpose + " · lập danh sách cần tìm", System: analystSystem,
-		MaxTokens: 4000, Messages: []llm.Message{llm.TextMessage(llm.RoleUser, fmt.Sprintf(planPrompt, task, brief, maxSearches))}})
+func (s *Service) researchPlanned(ctx context.Context, p llm.Provider, maxOut, inChars int, kbIDs []string, purpose, task, brief string) (string, error) {
+	plan, err := llm.Complete(ctx, p, llm.Request{Purpose: purpose + " · lập danh sách cần tìm", System: prompts.Get("analyst-system"),
+		MaxTokens: min(maxOut, 4000), Messages: []llm.Message{llm.TextMessage(llm.RoleUser, prompts.Get("research-plan", "task", task, "brief", brief, "max", strconv.Itoa(maxSearches)))}})
 	if err != nil {
 		return "", err
 	}
@@ -184,15 +112,16 @@ func (s *Service) researchPlanned(ctx context.Context, p llm.Provider, kbIDs []s
 	}
 	var hits []rag.Hit
 	for _, q := range queries[:min(len(queries), maxSearches)] {
-		h, err := s.search(ctx, kbIDs, q, 4)
+		h, err := s.lore.Search(ctx, kbIDs, q, 4)
 		log.Printf("research: tìm %q → %d kết quả", q, len(h))
 		if err != nil {
 			return "", err
 		}
 		hits = append(hits, h...)
 	}
-	return llm.Complete(ctx, p, llm.Request{Purpose: purpose, System: analystSystem, MaxTokens: 10000,
-		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, task+"\n\n"+fmt.Sprintf(knowledgeNote, brief, rag.FormatContext(hits, plannedChars)))}})
+	knowledge := rag.FormatContext(hits, max(inChars-len([]rune(brief))-len([]rune(task))-2000, 1500))
+	return llm.Complete(ctx, p, llm.Request{Purpose: purpose, System: prompts.Get("analyst-system"), MaxTokens: maxOut,
+		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, task+"\n\n"+prompts.Get("research-knowledge", "brief", brief, "knowledge", knowledge))}})
 }
 
 func hintLine(hint string) string {
@@ -215,7 +144,7 @@ func (s *Service) GenerateCharacter(ctx context.Context, kbIDs []string, name, h
 			}
 		}
 	}
-	out, err := s.research(ctx, kbIDs, providerID, "tạo nhân vật "+name, fmt.Sprintf(characterPrompt, name, hintLine(hint)), extra)
+	out, err := s.research(ctx, kbIDs, providerID, "tạo nhân vật "+name, prompts.Get("character-card", "name", name, "hint", hintLine(hint)), extra)
 	if err != nil {
 		return store.Character{}, err
 	}
@@ -231,7 +160,7 @@ func (s *Service) GenerateCharacter(ctx context.Context, kbIDs []string, name, h
 }
 
 func (s *Service) GenerateScenario(ctx context.Context, kbIDs []string, hint, providerID string) (store.Scenario, error) {
-	out, err := s.research(ctx, kbIDs, providerID, "tạo bối cảnh", fmt.Sprintf(scenarioPrompt, hintLine(hint)), "")
+	out, err := s.research(ctx, kbIDs, providerID, "tạo bối cảnh", prompts.Get("scenario", "hint", hintLine(hint)), "")
 	if err != nil {
 		return store.Scenario{}, err
 	}
@@ -246,7 +175,7 @@ func (s *Service) GenerateScenario(ctx context.Context, kbIDs []string, hint, pr
 // ExtractCast lists the source characters who fit a scenario the user wrote
 // (GenerateScenario already returns a cast for generated ones).
 func (s *Service) ExtractCast(ctx context.Context, kbIDs []string, title, setting, providerID string) ([]store.CastMember, error) {
-	out, err := s.research(ctx, kbIDs, providerID, "trích xuất nhân vật "+title, fmt.Sprintf(castPrompt, title, setting), "")
+	out, err := s.research(ctx, kbIDs, providerID, "trích xuất nhân vật "+title, prompts.Get("cast", "title", title, "setting", setting), "")
 	if err != nil {
 		return nil, err
 	}

@@ -15,6 +15,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 
@@ -139,24 +140,53 @@ func (f Filter) where() map[string]any {
 	return map[string]any{"$and": conds}
 }
 
-func (s *Store) SearchTexts(ctx context.Context, sp Space, query string, f Filter, k int) ([]Hit, error) {
-	params := map[string]any{"query": query, "k": k, "where": f.where(), "space": sp.Name}
-	if sp.Embed != nil {
-		vecs, err := sp.Embed(ctx, []string{query}, true)
-		if err != nil {
-			return nil, err
-		}
-		params["embedding"] = vecs[0]
-	}
+// Retrieval runs in the worker with LangChain: in each embedding space, dense
+// vector search and BM25 keyword search over the same texts, fused by rank
+// (worker/imm_worker/retrieval.py). Queries for API spaces are embedded here,
+// where the provider's key is.
+
+// spaceQuery is one embedding space to search, as the worker expects it.
+type spaceQuery struct {
+	Name      string         `json:"name"`
+	Where     map[string]any `json:"where"`
+	Embedding []float32      `json:"embedding,omitempty"`
+}
+
+func (s *Store) search(ctx context.Context, query string, k int, sqs []spaceQuery) ([]Hit, error) {
 	var res struct {
-		Hits []Hit `json:"hits"`
+		Hits   []Hit    `json:"hits"`
+		Errors []string `json:"errors"`
 	}
-	err := s.w.Call(ctx, "store.query_texts", params, &res)
+	err := s.w.Call(ctx, "rag.search", map[string]any{"query": query, "k": k, "spaces": sqs}, &res)
+	for _, e := range res.Errors {
+		log.Printf("rag: bỏ qua một không gian embedding: %s", e)
+	}
 	return res.Hits, err
 }
 
+func (s *Store) spaceQuery(ctx context.Context, sp Space, query string, f Filter) (spaceQuery, error) {
+	q := spaceQuery{Name: sp.Name, Where: f.where()}
+	if sp.Embed != nil {
+		vecs, err := sp.Embed(ctx, []string{query}, true)
+		if err != nil {
+			return q, err
+		}
+		q.Embedding = vecs[0]
+	}
+	return q, nil
+}
+
+// SearchTexts searches one embedding space.
+func (s *Store) SearchTexts(ctx context.Context, sp Space, query string, f Filter, k int) ([]Hit, error) {
+	q, err := s.spaceQuery(ctx, sp, query, f)
+	if err != nil {
+		return nil, err
+	}
+	return s.search(ctx, query, k, []spaceQuery{q})
+}
+
 // SearchKBs searches knowledge bases that may live in different embedding
-// spaces: one query per space, merged by distance.
+// spaces, in one call that fuses the results.
 func (s *Store) SearchKBs(ctx context.Context, spaces Spaces, query string, f Filter, k int) ([]Hit, error) {
 	groups := map[string][]string{}
 	bySpace := map[string]Space{}
@@ -175,25 +205,25 @@ func (s *Store) SearchKBs(ctx context.Context, spaces Spaces, query string, f Fi
 		}
 		groups[sp.Name] = append(groups[sp.Name], id)
 	}
-	var all []Hit
+	var sqs []spaceQuery
 	for _, name := range order {
 		g := f
 		g.KBIDs = groups[name]
-		hits, err := s.SearchTexts(ctx, bySpace[name], query, g, k)
+		q, err := s.spaceQuery(ctx, bySpace[name], query, g)
 		if err != nil {
 			firstErr = cmp.Or(firstErr, err)
 			continue
 		}
-		all = append(all, hits...)
+		sqs = append(sqs, q)
 	}
-	if len(all) == 0 && firstErr != nil {
+	if len(sqs) == 0 {
 		return nil, firstErr
 	}
-	if len(order) > 1 {
-		sort.SliceStable(all, func(i, j int) bool { return all[i].Distance < all[j].Distance })
-		all = all[:min(k, len(all))]
+	hits, err := s.search(ctx, query, k, sqs)
+	if len(hits) == 0 && err == nil {
+		err = firstErr
 	}
-	return all, nil
+	return hits, err
 }
 
 // SearchImages returns comic pages whose image embedding matches the text query.

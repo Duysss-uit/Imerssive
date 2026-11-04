@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS messages (
 	summarized INTEGER DEFAULT 0, created_at INTEGER);
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
 CREATE INDEX IF NOT EXISTS idx_sources_kb ON sources(kb_id);
+CREATE TABLE IF NOT EXISTS chapters (
+	id TEXT PRIMARY KEY, kb_id TEXT, source_id TEXT, idx INTEGER, title TEXT, pages TEXT,
+	summary TEXT, cast_json TEXT DEFAULT '[]');
+CREATE INDEX IF NOT EXISTS idx_chapters_kb ON chapters(kb_id);
 `
 
 // Columns added after the first release. SQLite has no ADD COLUMN IF NOT EXISTS,
@@ -51,6 +55,11 @@ var migrations = []string{
 	`ALTER TABLE scenarios ADD COLUMN cast_json TEXT DEFAULT '[]'`,
 	`ALTER TABLE providers ADD COLUMN thinking TEXT DEFAULT ''`,
 	`ALTER TABLE scenarios ADD COLUMN quick INTEGER DEFAULT 0`,
+	`ALTER TABLE sources ADD COLUMN seq INTEGER DEFAULT 0`,
+	`ALTER TABLE sources ADD COLUMN sections INTEGER DEFAULT 0`,
+	`ALTER TABLE providers ADD COLUMN context_window INTEGER DEFAULT 0`,
+	`ALTER TABLE chats ADD COLUMN divergence TEXT DEFAULT ''`,
+	`ALTER TABLE chats ADD COLUMN divergence_upto INTEGER DEFAULT 0`,
 }
 
 func Open(path string) (*Store, error) {
@@ -139,7 +148,7 @@ func (s *Store) SetSetting(key, value string) error {
 // ---- providers ----
 
 func (s *Store) Providers() ([]Provider, error) {
-	rows, err := s.db.Query(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking FROM providers ORDER BY name`)
+	rows, err := s.db.Query(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window FROM providers ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +157,7 @@ func (s *Store) Providers() ([]Provider, error) {
 	for rows.Next() {
 		var p Provider
 		var vision int
-		if err := rows.Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking, &p.ContextWindow); err != nil {
 			return nil, err
 		}
 		p.Vision = vision == 1
@@ -160,8 +169,8 @@ func (s *Store) Providers() ([]Provider, error) {
 func (s *Store) Provider(id string) (Provider, error) {
 	var p Provider
 	var vision int
-	err := s.db.QueryRow(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking FROM providers WHERE id=?`, id).
-		Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking)
+	err := s.db.QueryRow(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window FROM providers WHERE id=?`, id).
+		Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking, &p.ContextWindow)
 	p.Vision = vision == 1
 	return p, err
 }
@@ -170,10 +179,10 @@ func (s *Store) SaveProvider(p *Provider) error {
 	if p.ID == "" {
 		p.ID = NewID()
 	}
-	_, err := s.db.Exec(`INSERT INTO providers(id,name,kind,base_url,model,vision,temperature,effort,thinking) VALUES(?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO providers(id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window) VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind, base_url=excluded.base_url,
-		model=excluded.model, vision=excluded.vision, temperature=excluded.temperature, effort=excluded.effort, thinking=excluded.thinking`,
-		p.ID, p.Name, p.Kind, p.BaseURL, p.Model, b2i(p.Vision), p.Temperature, p.Effort, p.Thinking)
+		model=excluded.model, vision=excluded.vision, temperature=excluded.temperature, effort=excluded.effort, thinking=excluded.thinking, context_window=excluded.context_window`,
+		p.ID, p.Name, p.Kind, p.BaseURL, p.Model, b2i(p.Vision), p.Temperature, p.Effort, p.Thinking, p.ContextWindow)
 	return err
 }
 
@@ -236,20 +245,23 @@ func (s *Store) DeleteKnowledgeBase(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM sources WHERE kb_id=?`, id); err != nil {
 		return err
 	}
+	if _, err := s.db.Exec(`DELETE FROM chapters WHERE kb_id=?`, id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`DELETE FROM knowledge_bases WHERE id=?`, id)
 	return err
 }
 
-const sourceCols = `id,kb_id,filename,path,comic_mode,status,progress,error,pages,created_at`
+const sourceCols = `id,kb_id,filename,path,comic_mode,status,progress,error,pages,seq,sections,created_at`
 
 func scanSource(sc interface{ Scan(...any) error }) (Source, error) {
 	var x Source
-	err := sc.Scan(&x.ID, &x.KBID, &x.Filename, &x.Path, &x.ComicMode, &x.Status, &x.Progress, &x.Error, &x.Pages, &x.CreatedAt)
+	err := sc.Scan(&x.ID, &x.KBID, &x.Filename, &x.Path, &x.ComicMode, &x.Status, &x.Progress, &x.Error, &x.Pages, &x.Seq, &x.Sections, &x.CreatedAt)
 	return x, err
 }
 
 func (s *Store) Sources(kbID string) ([]Source, error) {
-	rows, err := s.db.Query(`SELECT `+sourceCols+` FROM sources WHERE kb_id=? ORDER BY created_at`, kbID)
+	rows, err := s.db.Query(`SELECT `+sourceCols+` FROM sources WHERE kb_id=? ORDER BY seq, created_at, rowid`, kbID)
 	if err != nil {
 		return nil, err
 	}
@@ -274,8 +286,10 @@ func (s *Store) InsertSource(x *Source) error {
 		x.ID = NewID()
 	}
 	x.CreatedAt = now()
-	_, err := s.db.Exec(`INSERT INTO sources(`+sourceCols+`) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		x.ID, x.KBID, x.Filename, x.Path, x.ComicMode, x.Status, x.Progress, x.Error, x.Pages, x.CreatedAt)
+	// Story order: a document added later is a later part of the work.
+	s.db.QueryRow(`SELECT COALESCE(MAX(seq),0)+1 FROM sources WHERE kb_id=?`, x.KBID).Scan(&x.Seq)
+	_, err := s.db.Exec(`INSERT INTO sources(`+sourceCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		x.ID, x.KBID, x.Filename, x.Path, x.ComicMode, x.Status, x.Progress, x.Error, x.Pages, x.Seq, x.Sections, x.CreatedAt)
 	return err
 }
 
@@ -289,16 +303,108 @@ func (s *Store) SetSourcePages(id string, pages int) error {
 	return err
 }
 
+// SetSourceSections records how many summarized parts a source contributed.
+func (s *Store) SetSourceSections(id string, n int) error {
+	_, err := s.db.Exec(`UPDATE sources SET sections=? WHERE id=?`, n, id)
+	return err
+}
+
 func (s *Store) DeleteSource(id string) error {
+	if _, err := s.db.Exec(`DELETE FROM chapters WHERE source_id=?`, id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`DELETE FROM sources WHERE id=?`, id)
 	return err
 }
 
-// MarkInterruptedSources flags sources that were mid-ingest when the app closed.
-func (s *Store) MarkInterruptedSources() error {
-	_, err := s.db.Exec(`UPDATE sources SET status='error', error='Bị gián đoạn khi đóng ứng dụng — hãy xử lý lại'
-		WHERE status NOT IN ('done','error')`)
+// ---- chapters (the story map) ----
+
+// Chapters lists a work's chapters in story order, numbered from 1.
+func (s *Store) Chapters(kbID string) ([]Chapter, error) {
+	rows, err := s.db.Query(`SELECT c.id,c.kb_id,c.source_id,c.idx,c.title,c.pages,c.summary,c.cast_json
+		FROM chapters c JOIN sources s ON s.id=c.source_id WHERE c.kb_id=? ORDER BY s.seq, s.created_at, s.rowid, c.idx`, kbID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Chapter{}
+	for rows.Next() {
+		var c Chapter
+		var cast string
+		if err := rows.Scan(&c.ID, &c.KBID, &c.SourceID, &c.Idx, &c.Title, &c.Pages, &c.Summary, &cast); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(cast), &c.Cast)
+		if c.Cast == nil {
+			c.Cast = []string{}
+		}
+		c.No = len(out) + 1
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SetChapters replaces the chapters a source contributed.
+func (s *Store) SetChapters(sourceID string, chs []Chapter) error {
+	if _, err := s.db.Exec(`DELETE FROM chapters WHERE source_id=?`, sourceID); err != nil {
+		return err
+	}
+	for i, c := range chs {
+		if c.ID == "" {
+			c.ID = NewID()
+		}
+		if c.Cast == nil {
+			c.Cast = []string{}
+		}
+		cast, _ := json.Marshal(c.Cast)
+		_, err := s.db.Exec(`INSERT INTO chapters(id,kb_id,source_id,idx,title,pages,summary,cast_json) VALUES(?,?,?,?,?,?,?,?)`,
+			c.ID, c.KBID, sourceID, i, c.Title, c.Pages, c.Summary, string(cast))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteChapters forgets a work's story map (it is rebuilt from the start).
+func (s *Store) DeleteChapters(kbID string) error {
+	_, err := s.db.Exec(`DELETE FROM chapters WHERE kb_id=?`, kbID)
 	return err
+}
+
+// MarkInterruptedSources flags sources that were being read when the app
+// closed. Sources caught mid-embedding or mid-summary were already read: they
+// go back a step and continue at startup.
+func (s *Store) MarkInterruptedSources() error {
+	for _, q := range []string{
+		`UPDATE sources SET status='read', progress='' WHERE status='embedding'`,
+		`UPDATE sources SET status='embedded', progress='' WHERE status='summarizing'`,
+		`UPDATE sources SET status='error', error='Bị gián đoạn khi đóng ứng dụng — hãy xử lý lại'
+		WHERE status NOT IN ('done','error','read','embedded')`,
+	} {
+		if _, err := s.db.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PendingSummaryKBs lists knowledge bases with sources read but not yet embedded or summarized.
+func (s *Store) PendingSummaryKBs() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT kb_id FROM sources WHERE status IN ('read','embedded')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // ---- characters ----
@@ -416,11 +522,11 @@ func (s *Store) DeleteScenario(id string) error {
 
 // ---- chats & messages ----
 
-const chatCols = `id,mode,character_id,scenario_id,persona_name,persona_desc,title,provider_id,updated_at`
+const chatCols = `id,mode,character_id,scenario_id,persona_name,persona_desc,title,provider_id,updated_at,divergence,divergence_upto`
 
 func scanChat(sc interface{ Scan(...any) error }) (Chat, error) {
 	var c Chat
-	err := sc.Scan(&c.ID, &c.Mode, &c.CharacterID, &c.ScenarioID, &c.PersonaName, &c.PersonaDesc, &c.Title, &c.ProviderID, &c.UpdatedAt)
+	err := sc.Scan(&c.ID, &c.Mode, &c.CharacterID, &c.ScenarioID, &c.PersonaName, &c.PersonaDesc, &c.Title, &c.ProviderID, &c.UpdatedAt, &c.Divergence, &c.DivergenceUpTo)
 	return c, err
 }
 
@@ -450,10 +556,22 @@ func (s *Store) SaveChat(c *Chat) error {
 		c.ID = NewID()
 	}
 	c.UpdatedAt = now()
-	_, err := s.db.Exec(`INSERT INTO chats(`+chatCols+`) VALUES(?,?,?,?,?,?,?,?,?)
+	// The divergence log has its own setter: saving a chat never overwrites it.
+	_, err := s.db.Exec(`INSERT INTO chats(`+chatCols+`) VALUES(?,?,?,?,?,?,?,?,?,'',0)
 		ON CONFLICT(id) DO UPDATE SET persona_name=excluded.persona_name, persona_desc=excluded.persona_desc,
 		title=excluded.title, provider_id=excluded.provider_id, updated_at=excluded.updated_at`,
 		c.ID, c.Mode, c.CharacterID, c.ScenarioID, c.PersonaName, c.PersonaDesc, c.Title, c.ProviderID, c.UpdatedAt)
+	return err
+}
+
+// SetDivergence stores a chat's divergence log; upTo (when > 0) is the last
+// message it now accounts for.
+func (s *Store) SetDivergence(id, text string, upTo int64) error {
+	if upTo > 0 {
+		_, err := s.db.Exec(`UPDATE chats SET divergence=?, divergence_upto=? WHERE id=?`, text, upTo, id)
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE chats SET divergence=? WHERE id=?`, text, id)
 	return err
 }
 

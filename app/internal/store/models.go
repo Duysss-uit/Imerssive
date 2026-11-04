@@ -11,7 +11,9 @@ type Provider struct {
 	Temperature float64 `json:"temperature"`
 	Effort      string  `json:"effort"`
 	Thinking    string  `json:"thinking"` // "" = model default, "off" = ask the model not to think
-	HasKey      bool    `json:"hasKey"`
+	// ContextWindow is the model's context length in tokens; 0 = detect it.
+	ContextWindow int  `json:"contextWindow"`
+	HasKey        bool `json:"hasKey"`
 }
 
 // KnowledgeBase groups source documents (a novel, a manga series...) that
@@ -20,7 +22,7 @@ type KnowledgeBase struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Overview    string `json:"overview"` // auto-generated summary of all sources
+	Overview    string `json:"overview"` // the story map: one entry per chapter, in story order
 	CreatedAt   int64  `json:"createdAt"`
 
 	// Providers used to process this KB's documents; empty = the role default in settings.
@@ -37,10 +39,12 @@ type Source struct {
 	Filename  string `json:"filename"`
 	Path      string `json:"path"`
 	ComicMode string `json:"comicMode"` // vision | embed | both
-	Status    string `json:"status"`    // queued | extracting | reading | summarizing | embedding | done | error
+	Status    string `json:"status"`    // queued | extracting | reading | read (waiting to be embedded) | embedding | embedded (waiting to be summarized) | summarizing | done | error
 	Progress  string `json:"progress"`
 	Error     string `json:"error"`
 	Pages     int    `json:"pages"`
+	Seq       int    `json:"seq"`      // story order within the knowledge base
+	Sections  int    `json:"sections"` // chapters it contributed to the story map
 	CreatedAt int64  `json:"createdAt"`
 }
 
@@ -94,6 +98,24 @@ type Chat struct {
 	Title       string `json:"title"`
 	ProviderID  string `json:"providerId"` // chat model; empty = default chat provider
 	UpdatedAt   int64  `json:"updatedAt"`
+	// Divergence is how this story has departed from the source so far, kept
+	// by the model every few turns and editable by the player.
+	Divergence     string `json:"divergence"`
+	DivergenceUpTo int64  `json:"-"` // last message the log accounts for
+}
+
+// Chapter is one entry of a work's story map: a chapter (or part of a long
+// one) with a short summary and who appears in it.
+type Chapter struct {
+	ID       string   `json:"id"`
+	KBID     string   `json:"kbId"`
+	SourceID string   `json:"sourceId"`
+	Idx      int      `json:"idx"` // order within its source
+	No       int      `json:"no"`  // number in the whole work, from 1
+	Title    string   `json:"title"`
+	Pages    string   `json:"pages"`
+	Summary  string   `json:"summary"`
+	Cast     []string `json:"cast"`
 }
 
 type Message struct {

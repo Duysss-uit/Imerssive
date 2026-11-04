@@ -81,6 +81,9 @@ type Config struct {
 	Temperature float64 // 0 = provider default (ignored by Anthropic)
 	Effort      string  // Anthropic only: low|medium|high|xhigh|max, empty = default
 	NoThinking  bool    // ask a reasoning model to answer without thinking (OpenAI-compatible kinds)
+	// ContextWindow is the model's context length in tokens (0 = unknown);
+	// prompts are sized to fit it (see Budget).
+	ContextWindow int
 }
 
 // DefaultBaseURL returns the preset endpoint for a kind.

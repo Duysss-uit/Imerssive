@@ -10,6 +10,11 @@ def _extract(**kw):
     return docs.extract(**kw)
 
 
+def _search(**kw):
+    from . import retrieval
+    return retrieval.search(**kw)
+
+
 def _vec(name):
     def call(**kw):
         from . import vectors
@@ -26,4 +31,5 @@ METHODS = {
     "store.query_images": _vec("query_images"),
     "store.get_texts": _vec("get_texts"),
     "store.delete": _vec("delete"),
+    "rag.search": _search,
 }

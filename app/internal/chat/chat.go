@@ -9,14 +9,18 @@ package chat
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
 	"immersive/internal/llm"
+	"immersive/internal/lore"
+	"immersive/internal/prompts"
 	"immersive/internal/rag"
 	"immersive/internal/store"
 )
@@ -28,22 +32,36 @@ type Options struct {
 	MaxTokens    int  // reply length cap
 	AttachImages bool // attach retrieved comic pages when the model supports vision
 	ImageK       int
+	// DivergenceEvery is how many replies pass between updates of the
+	// divergence log (0 = never).
+	DivergenceEvery int
+}
+
+// vectors is the part of the vector store chat uses (rag.Store; swapped in tests).
+type vectors interface {
+	SearchKBs(ctx context.Context, spaces rag.Spaces, query string, f rag.Filter, k int) ([]rag.Hit, error)
+	SearchImages(ctx context.Context, query string, f rag.Filter, k int) ([]rag.Hit, error)
+	AddTexts(ctx context.Context, sp rag.Space, docs []rag.Doc) error
+	Delete(ctx context.Context, f rag.Filter) error
 }
 
 type Engine struct {
 	st      *store.Store
-	rag     *rag.Store
+	rag     vectors
+	lore    *lore.Lore
 	spaces  rag.Spaces
 	resolve llm.Resolver
 	opts    func() Options
 	emit    func(event string, data any)
 
-	mu      sync.Mutex
-	running map[string]context.CancelFunc
+	mu        sync.Mutex
+	running   map[string]context.CancelFunc
+	diverging map[string]bool // chats whose divergence log is being updated
 }
 
-func New(st *store.Store, r *rag.Store, spaces rag.Spaces, resolve llm.Resolver, opts func() Options, emit func(string, any)) *Engine {
-	return &Engine{st: st, rag: r, spaces: spaces, resolve: resolve, opts: opts, emit: emit, running: map[string]context.CancelFunc{}}
+func New(st *store.Store, r vectors, lr *lore.Lore, spaces rag.Spaces, resolve llm.Resolver, opts func() Options, emit func(string, any)) *Engine {
+	return &Engine{st: st, rag: r, lore: lr, spaces: spaces, resolve: resolve, opts: opts, emit: emit,
+		running: map[string]context.CancelFunc{}, diverging: map[string]bool{}}
 }
 
 func MemoryKB(chatID string) string { return "chat:" + chatID }
@@ -203,75 +221,126 @@ func (e *Engine) respond(chatID string) {
 		e.emit("chat:done", map[string]any{"chatId": chatID})
 	}
 	if err == nil {
+		go e.updateDivergence(chatID)
 		if err := e.compress(context.Background(), chatID); err != nil {
 			log.Printf("chat: compress memory: %v", err)
 		}
 	}
 }
 
-func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
-	opts := e.opts()
+// maxLookups is how many tool calls the model may make before one reply.
+const maxLookups = 4
+
+// setup is what a turn of a conversation needs, whatever the model.
+type setup struct {
+	chat    store.Chat
+	scen    *store.Scenario
+	system  string   // rules, cards, scenario (byte-stable for caching)
+	kbIDs   []string // the works the story draws from
+	other   string   // who the model plays: the character, or the narrator
+	history []store.Message
+}
+
+func (e *Engine) setup(chatID string) (setup, error) {
+	var s setup
 	c, err := e.st.Chat(chatID)
 	if err != nil {
-		return "", err
+		return s, err
 	}
-	var scen *store.Scenario
+	s.chat = c
 	if c.ScenarioID != "" {
-		if s, err := e.st.Scenario(c.ScenarioID); err == nil {
-			scen = &s
+		if sc, err := e.st.Scenario(c.ScenarioID); err == nil {
+			s.scen = &sc
 		}
 	}
-	var system string
-	var kbIDs []string
 	if c.Mode == store.ModeScene {
-		if scen == nil {
-			return "", fmt.Errorf("bối cảnh của scene này đã bị xoá")
+		if s.scen == nil {
+			return s, fmt.Errorf("bối cảnh của scene này đã bị xoá")
 		}
 		cards, _ := e.st.Characters()
-		system = buildSceneSystem(*scen, c, cards)
-		kbIDs = union(scen.KBIDs, nil)
+		s.system = buildSceneSystem(*s.scen, c, cards)
+		s.kbIDs = union(s.scen.KBIDs, nil)
+		s.other = Narrator
 	} else {
 		char, err := e.st.Character(c.CharacterID)
 		if err != nil {
-			return "", err
+			return s, err
 		}
-		system = buildSystem(char, scen, c)
-		kbIDs = char.KBIDs
-		if scen != nil {
-			kbIDs = union(kbIDs, scen.KBIDs)
+		s.system = buildSystem(char, s.scen, c)
+		s.kbIDs = char.KBIDs
+		if s.scen != nil {
+			s.kbIDs = union(s.kbIDs, s.scen.KBIDs)
 		}
+		s.other = char.Name
 	}
-	history, err := e.st.Messages(chatID, true)
+	s.history, err = e.st.Messages(chatID, true)
+	return s, err
+}
+
+// loreBlock tells the model how to use the source: the rules, the story map
+// (in at most mapChars) and this story's divergence log.
+func (e *Engine) loreBlock(s setup, mapChars int) string {
+	var sb strings.Builder
+	sb.WriteString("\n" + fill(prompts.Get("chat-lore"), s.other, s.chat.PersonaName) + "\n")
+	if m := e.lore.Map(s.kbIDs, mapChars); m != "" {
+		sb.WriteString("\n<story_map>\n" + m + "\n</story_map>\n")
+	}
+	if d := strings.TrimSpace(s.chat.Divergence); d != "" {
+		sb.WriteString("\n<divergence>\n" + d + "\n</divergence>\n")
+	}
+	return sb.String()
+}
+
+func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
+	opts := e.opts()
+	s, err := e.setup(chatID)
 	if err != nil {
 		return "", err
 	}
+	c := s.chat
 	provider, err := e.resolve(llm.RoleChat, c.ProviderID)
 	if err != nil {
 		return "", err
 	}
+	maxOut, inChars := llm.Budget(provider, opts.MaxTokens)
+	system := s.system + e.loreBlock(s, inChars/5)
 
 	// Retrieval query: the latest exchange carries the most signal. Before
 	// anything has been said, look up where the story starts and who the player is.
 	var query string
-	for i := len(history) - 1; i >= 0 && i >= len(history)-2; i-- {
-		query = truncate(history[i].Content, 600) + "\n" + query
+	for i := len(s.history) - 1; i >= 0 && i >= len(s.history)-2; i-- {
+		query = truncate(s.history[i].Content, 600) + "\n" + query
 	}
-	if len(history) == 0 && scen != nil {
-		query = strings.TrimSpace(scen.Title + "\n" + truncate(scen.Setting, 600) + "\n" + c.PersonaName + " " + truncate(c.PersonaDesc, 300))
+	if len(s.history) == 0 && s.scen != nil {
+		query = strings.TrimSpace(s.scen.Title + "\n" + truncate(s.scen.Setting, 600) + "\n" + c.PersonaName + " " + truncate(c.PersonaDesc, 300))
+	}
+	memoryChars := min(opts.ContextChars, inChars/4)
+	e.emit("chat:start", map[string]any{"chatId": chatID})
+	onDelta := func(delta string) {
+		e.emit("chat:delta", map[string]any{"chatId": chatID, "delta": delta})
+	}
+	onReasoning := func(string) {
+		e.emit("chat:thinking", map[string]any{"chatId": chatID})
 	}
 
-	var memory string
-	if query != "" {
-		hits, err := e.rag.SearchKBs(ctx, e.spaces, query, rag.Filter{KBIDs: append(kbIDs, MemoryKB(chatID))}, opts.RAGK)
-		if err != nil {
-			log.Printf("chat: retrieval failed, continuing without memory: %v", err)
+	// With tools, the model looks the source up itself; only this
+	// conversation's own memory is retrieved for it.
+	if tu, ok := provider.(llm.ToolUser); ok && len(s.kbIDs) > 0 {
+		memory := e.retrieve(ctx, query, []string{MemoryKB(chatID)}, opts.RAGK/2+1, memoryChars)
+		// Lookup results need room too: a quarter of the context.
+		msgs := e.messages(s, memory, nil, inChars-len([]rune(system))-inChars/4)
+		reply, err := e.withTools(ctx, tu, chatID, s.kbIDs, llm.Request{Purpose: "chat · " + c.Title, System: system,
+			Messages: msgs, MaxTokens: maxOut, OnReasoning: onReasoning}, max(inChars/(4*maxLookups), 1000), onDelta)
+		if !errors.Is(err, llm.ErrNoTools) {
+			return reply, err
 		}
-		memory = rag.FormatContext(hits, opts.ContextChars)
+		log.Printf("chat: %s: model không gọi được công cụ, tự truy xuất thay", c.Title)
 	}
 
+	memory := e.retrieve(ctx, query, append(slices.Clone(s.kbIDs), MemoryKB(chatID)), opts.RAGK, memoryChars)
 	var images []llm.Part
-	if opts.AttachImages && provider.SupportsVision() && len(kbIDs) > 0 && query != "" {
-		hits, err := e.rag.SearchImages(ctx, query, rag.Filter{KBIDs: kbIDs}, opts.ImageK)
+	if opts.AttachImages && provider.SupportsVision() && len(s.kbIDs) > 0 && query != "" {
+		hits, err := e.rag.SearchImages(ctx, query, rag.Filter{KBIDs: s.kbIDs}, opts.ImageK)
 		if err == nil {
 			for _, h := range hits {
 				if data, err := os.ReadFile(h.Text); err == nil {
@@ -280,8 +349,39 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 			}
 		}
 	}
+	msgs := e.messages(s, memory, images, inChars-len([]rune(system)))
+	return provider.Stream(ctx, llm.Request{Purpose: "chat · " + c.Title, System: system, Messages: msgs,
+		MaxTokens: maxOut, OnReasoning: onReasoning}, onDelta)
+}
 
-	msgs := make([]llm.Message, 0, len(history))
+// retrieve searches kbIDs for the query and formats what it finds.
+func (e *Engine) retrieve(ctx context.Context, query string, kbIDs []string, k, maxChars int) string {
+	if query == "" {
+		return ""
+	}
+	hits, err := e.rag.SearchKBs(ctx, e.spaces, query, rag.Filter{KBIDs: kbIDs}, k)
+	if err != nil {
+		log.Printf("chat: retrieval failed, continuing without memory: %v", err)
+	}
+	return rag.FormatContext(hits, maxChars)
+}
+
+// messages turns the history into model messages that fit in maxChars
+// (oldest dropped first) and attaches retrieved memory and pages to the
+// newest user turn (not persisted; the system prompt stays stable).
+func (e *Engine) messages(s setup, memory string, images []llm.Part, maxChars int) []llm.Message {
+	maxChars -= len([]rune(memory)) + 1500*len(images)
+	history := s.history
+	total := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		total += len([]rune(history[i].Content)) + 20
+		if total > maxChars && i < len(history)-1 {
+			log.Printf("chat: %s: bỏ %d tin nhắn cũ cho vừa ngữ cảnh của model", s.chat.Title, i+1)
+			history = history[i+1:]
+			break
+		}
+	}
+	msgs := make([]llm.Message, 0, len(history)+1)
 	for _, m := range history {
 		role := llm.RoleUser
 		if m.Role == "assistant" {
@@ -291,10 +391,9 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 	}
 	if len(msgs) == 0 || msgs[0].Role != llm.RoleUser {
 		// Some APIs require the conversation to open with a user turn.
-		msgs = append([]llm.Message{llm.TextMessage(llm.RoleUser, "*("+c.PersonaName+" bước vào câu chuyện)*")}, msgs...)
+		msgs = append([]llm.Message{llm.TextMessage(llm.RoleUser, "*("+s.chat.PersonaName+" bước vào câu chuyện)*")}, msgs...)
 	}
-	// Attach retrieved context to the final user turn only (it is not persisted).
-	if n := len(msgs); n > 0 && msgs[n-1].Role == llm.RoleUser && (memory != "" || len(images) > 0) {
+	if n := len(msgs); msgs[n-1].Role == llm.RoleUser && (memory != "" || len(images) > 0) {
 		var parts []llm.Part
 		if memory != "" {
 			parts = append(parts, llm.Part{Text: "<memory>\n" + memory + "\n</memory>"})
@@ -305,26 +404,56 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 		}
 		msgs[n-1].Parts = append(parts, msgs[n-1].Parts...)
 	}
-
-	e.emit("chat:start", map[string]any{"chatId": chatID})
-	return provider.Stream(ctx, llm.Request{
-		Purpose:   "chat · " + c.Title,
-		System:    system,
-		Messages:  msgs,
-		MaxTokens: opts.MaxTokens,
-		OnReasoning: func(string) {
-			e.emit("chat:thinking", map[string]any{"chatId": chatID})
-		},
-	}, func(delta string) {
-		e.emit("chat:delta", map[string]any{"chatId": chatID, "delta": delta})
-	})
+	return msgs
 }
 
-const memoryPrompt = `Summarize this roleplay excerpt between %s and %s as long-term memory notes.
-Capture: events that happened, facts revealed about either side, promises and plans, relationship and mood changes, items gained or lost, where the scene is now.
-Write terse bullet points in the same language as the conversation. Output only the notes.
-
-%s`
+// withTools runs a reply in which the model may look the source up first. It
+// returns llm.ErrNoTools, before anything is streamed, when the model can't
+// call tools.
+func (e *Engine) withTools(ctx context.Context, tu llm.ToolUser, chatID string, kbIDs []string, req llm.Request, resultChars int, onDelta func(string)) (string, error) {
+	var reply strings.Builder
+	purpose := req.Purpose
+	lookups := 0
+	for round := 1; ; round++ {
+		req.Tools = lore.Tools
+		req.NoMoreTools = lookups >= maxLookups
+		if round > 1 {
+			req.Purpose = fmt.Sprintf("%s · lượt %d", purpose, round)
+		}
+		first := true
+		t, err := tu.Turn(ctx, req, func(d string) {
+			if first && reply.Len() > 0 {
+				onDelta("\n\n") // text before a lookup and after it are paragraphs of one reply
+			}
+			first = false
+			onDelta(d)
+		})
+		if t.Text != "" {
+			if reply.Len() > 0 {
+				reply.WriteString("\n\n")
+			}
+			reply.WriteString(t.Text)
+		}
+		if err != nil || len(t.Calls) == 0 || req.NoMoreTools {
+			return reply.String(), err
+		}
+		msg := llm.Message{Role: llm.RoleAssistant, Calls: t.Calls}
+		if strings.TrimSpace(t.Text) != "" {
+			msg.Parts = []llm.Part{{Text: t.Text}}
+		}
+		req.Messages = append(req.Messages, msg)
+		for _, call := range t.Calls {
+			result := "Đã hết lượt tra cứu. Hãy viết câu trả lời từ những gì đã có."
+			if lookups < maxLookups {
+				lookups++
+				e.emit("chat:lookup", map[string]any{"chatId": chatID, "tool": call.Name, "args": call.Args})
+				result = e.lore.Run(ctx, kbIDs, call, resultChars)
+				log.Printf("chat: %s tra cứu %s %s → %d ký tự", chatID, call.Name, call.Args, len([]rune(result)))
+			}
+			req.Messages = append(req.Messages, llm.Message{Role: llm.RoleTool, CallID: call.ID, Parts: []llm.Part{{Text: result}}})
+		}
+	}
+}
 
 // compress folds the oldest active messages into a memory document once the
 // live window grows past Options.Window.
@@ -335,6 +464,12 @@ func (e *Engine) compress(ctx context.Context, chatID string) error {
 		return err
 	}
 	fold := msgs[:len(msgs)-opts.Window/2]
+	p, err := e.resolve(llm.RoleSummarize, "")
+	if err != nil {
+		return err
+	}
+	maxOut, inChars := llm.Budget(p, 3000)
+	fold = fitMessages(fold, inChars-2000) // the rest folds next time
 	c, err := e.st.Chat(chatID)
 	if err != nil {
 		return err
@@ -355,12 +490,8 @@ func (e *Engine) compress(ctx context.Context, chatID string) error {
 		}
 		fmt.Fprintf(&sb, "%s: %s\n\n", who, m.Content)
 	}
-	p, err := e.resolve(llm.RoleSummarize, "")
-	if err != nil {
-		return err
-	}
-	notes, err := llm.Complete(ctx, p, llm.Request{Purpose: "nén ký ức · " + c.Title, MaxTokens: 6000, Messages: []llm.Message{
-		llm.TextMessage(llm.RoleUser, fmt.Sprintf(memoryPrompt, other, c.PersonaName, sb.String()))}})
+	notes, err := llm.Complete(ctx, p, llm.Request{Purpose: "nén ký ức · " + c.Title, MaxTokens: maxOut, Messages: []llm.Message{
+		llm.TextMessage(llm.RoleUser, prompts.Get("chat-memory", "other", other, "player", c.PersonaName, "excerpt", sb.String()))}})
 	if err != nil {
 		return err
 	}
@@ -379,15 +510,7 @@ func (e *Engine) compress(ctx context.Context, chatID string) error {
 
 func buildSystem(c store.Character, scen *store.Scenario, chat store.Chat) string {
 	var sb strings.Builder
-	sb.WriteString(`You are {{char}} in an immersive, ongoing roleplay with {{user}}.
-- Stay in character at all times. Write only {{char}}'s words, actions and thoughts; never speak or act for {{user}}.
-- Use *asterisks* for actions and narration, plain text for speech.
-- A <memory> block may precede {{user}}'s message: it is knowledge retrieved from the source work and from earlier in this conversation. Treat it as canon and stay consistent with it; never mention the block itself. When it doesn't cover something, improvise in a way that fits the canon.
-- Reply in the language {{user}} writes in.
-- Keep replies vivid and focused (usually 1-4 paragraphs), move the scene forward, and leave room for {{user}} to act.
-
-<character>
-`)
+	sb.WriteString(prompts.Get("chat-character") + "\n\n<character>\n")
 	field := func(label, v string) {
 		if strings.TrimSpace(v) != "" {
 			fmt.Fprintf(&sb, "%s: %s\n", label, strings.TrimSpace(v))
@@ -415,23 +538,7 @@ func buildSystem(c store.Character, scen *store.Scenario, chat store.Chat) strin
 // name get the card's personality and speaking style too.
 func buildSceneSystem(scen store.Scenario, chat store.Chat, cards []store.Character) string {
 	var sb strings.Builder
-	sb.WriteString(`You are the narrator and game master of an immersive, ongoing interactive story. The player has stepped into it as {{user}}.
-- You run the world and every character except {{user}}: describe the scene, voice the cast, and play out the consequences of {{user}}'s actions honestly, including failure and danger.
-- {{user}} belongs to the player alone. Never write {{user}}'s speech, actions, thoughts, feelings or decisions, and never assume their next move. End each turn at a moment that invites {{user}} to act.
-- The player writes *actions* in asterisks and speech as plain text.
-- Split every turn into blocks, each opened by a speaker tag alone on its own line: [Narrator] for narration and scene description, or [Name] for a character who speaks or acts. Inside a character's block, write their *actions* in asterisks and their speech in quotes. Use the exact names from the cast; a new character gets a short, consistent name of their own. Start a new block whenever the speaker changes, and never open a block for {{user}}. Example:
-[Narrator]
-Rain hammers the shrine roof as the lanterns gutter out.
-[Elder Mo]
-*grips his staff* "Someone is coming. Stay behind me."
-- Each cast member has their own goals, knowledge and voice, and acts on them without waiting for {{user}}. Keep them true to the source: personality, abilities, relationships and the way they talk. A character only knows what they would plausibly know at this point of the story.
-- If {{user}} is a character from the source, everyone treats them as that character (same relationships, history, reputation), but the player decides what they do, and the story may diverge from canon because of it.
-- Characters not listed in the cast may appear when the story calls for it, as long as they fit the source.
-- If nothing has been narrated yet, open the story: set the time, place and situation from the scenario (if it is vague or empty, pick a fitting moment of the source for {{user}}), bring in who is present, and end on a moment that invites {{user}} to act.
-- A <memory> block may precede the player's message: knowledge retrieved from the source work and from earlier in this story. Treat it as canon and stay consistent with it; never mention the block itself. When it doesn't cover something, improvise in a way that fits the canon.
-- Reply in the language the player writes in. Keep the tags exactly as above ([Narrator], [Name]) whatever the language. Keep turns vivid and focused (usually 2-6 blocks) and keep the story moving.
-
-`)
+	sb.WriteString(prompts.Get("chat-narrator") + "\n\n")
 	fmt.Fprintf(&sb, "<scenario title=%q>\n%s\n</scenario>\n", scen.Title, strings.TrimSpace(scen.Setting))
 
 	byName := map[string]store.Character{}

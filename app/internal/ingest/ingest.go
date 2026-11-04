@@ -1,13 +1,18 @@
-// Package ingest turns uploaded documents into RAG knowledge:
+// Package ingest turns uploaded documents into knowledge the models look up
+// (see package lore):
 //
-//	extract pages ─┬─ text pages ──────────────┐
-//	               └─ image pages ─┬─ vision ──┤→ raw chunks ─→ section summaries + entities ─→ overview
-//	                               └─ embed ───→ page image vectors (no LLM tokens)
+//	extract pages ─┬─ text pages ──────────────────────────┐
+//	               └─ image pages ─┬─ vision, page by page ─┤→ text.json → raw chunks
+//	                               └─ CLIP (optional) ──────→ page image vectors
 //
-// Everything is embedded and stored in the vector store; nothing is kept in the model's context.
+// Once every queued document of the work is read and embedded, the story map
+// is built in one pass in story order (summarize.go): chapters, each read in
+// windows that fit the model's context, give one short map entry each, and
+// the characters and places met on the way give merged profiles.
 package ingest
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,30 +21,34 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"immersive/internal/llm"
+	"immersive/internal/lore"
+	"immersive/internal/prompts"
 	"immersive/internal/rag"
 	"immersive/internal/store"
 	"immersive/internal/worker"
 )
 
 type Options struct {
-	SectionChars int  // text per summarization call
-	ChunkChars   int  // raw chunk size
-	KeepRaw      bool // also embed original text, not just summaries
-	Concurrency  int  // parallel LLM calls
-	VisionBatch  int  // pages per vision call
+	ChapterChars  int  // longest stretch of text one story-map entry covers
+	ChunkChars    int  // raw chunk size
+	KeepRaw       bool // also embed original text, not just summaries
+	Concurrency   int  // parallel LLM calls
+	VisionMaxSide int  // longest side, in pixels, of a page image sent to the vision model
 }
 
 type Service struct {
 	st       *store.Store
 	w        *worker.Manager
 	rag      *rag.Store
-	lookup   lookup // what generation reads from the vector store (s.rag; swapped in tests)
+	lore     *lore.Lore // map, profiles and lookups (its vectors are s.rag; swapped in tests)
 	spaces   rag.Spaces
 	resolve  llm.Resolver
 	opts     func() Options
@@ -56,13 +65,39 @@ func New(st *store.Store, w *worker.Manager, r *rag.Store, spaces rag.Spaces, re
 	srcDir, pagesDir string, emit func(string, any)) *Service {
 	s := &Service{st: st, w: w, rag: r, spaces: spaces, resolve: resolve, opts: opts, srcDir: srcDir, pagesDir: pagesDir,
 		emit: emit, queue: make(chan string, 256), cancels: map[string]context.CancelFunc{}}
-	s.lookup = r
+	s.lore = &lore.Lore{St: st, Vec: r, Spaces: spaces, PagesDir: pagesDir}
 	go s.loop()
+	// Works left waiting for their summary when the app closed.
+	if ids, err := st.PendingSummaryKBs(); err == nil {
+		for _, id := range ids {
+			s.queue <- "kb:" + id
+		}
+	}
 	return s
 }
 
-// AddSource copies the file into app storage and queues it for processing.
-func (s *Service) AddSource(kbID, path, comicMode string) (store.Source, error) {
+// AddSources copies the files into app storage, in story order (natural file
+// name order: "Chương 2" before "Chương 10"), then queues them. They are all
+// recorded before any is read, so the whole batch is summarized in one pass.
+func (s *Service) AddSources(kbID string, paths []string, comicMode string) ([]store.Source, error) {
+	paths = slices.Clone(paths)
+	slices.SortStableFunc(paths, func(a, b string) int { return naturalCompare(filepath.Base(a), filepath.Base(b)) })
+	var out []store.Source
+	for _, p := range paths {
+		src, err := s.addSource(kbID, p, comicMode)
+		if err != nil {
+			return out, fmt.Errorf("%s: %w", p, err)
+		}
+		out = append(out, src)
+	}
+	for _, src := range out {
+		s.queue <- src.ID
+	}
+	return out, nil
+}
+
+// addSource copies one file into app storage and records it, without queueing it.
+func (s *Service) addSource(kbID, path, comicMode string) (store.Source, error) {
 	if comicMode == "" {
 		comicMode = "vision"
 	}
@@ -71,18 +106,48 @@ func (s *Service) AddSource(kbID, path, comicMode string) (store.Source, error) 
 	if err := copyFile(path, src.Path); err != nil {
 		return src, err
 	}
-	if err := s.st.InsertSource(&src); err != nil {
-		return src, err
+	return src, s.st.InsertSource(&src)
+}
+
+// naturalCompare orders strings with digit runs compared as numbers.
+func naturalCompare(a, b string) int {
+	for a != "" && b != "" {
+		da, db := digitPrefix(a), digitPrefix(b)
+		if da != "" && db != "" {
+			na, nb := strings.TrimLeft(da, "0"), strings.TrimLeft(db, "0")
+			if c := cmp.Compare(len(na), len(nb)); c != 0 {
+				return c
+			}
+			if c := strings.Compare(na, nb); c != 0 {
+				return c
+			}
+			a, b = a[len(da):], b[len(db):]
+			continue
+		}
+		ra, sa := utf8.DecodeRuneInString(a)
+		rb, sb := utf8.DecodeRuneInString(b)
+		if c := cmp.Compare(unicode.ToLower(ra), unicode.ToLower(rb)); c != 0 {
+			return c
+		}
+		a, b = a[sa:], b[sb:]
 	}
-	s.queue <- src.ID
-	return src, nil
+	return cmp.Compare(len(a), len(b))
+}
+
+func digitPrefix(s string) string {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	return s[:i]
 }
 
 // Reprocess clears a source's vectors and queues it again.
 func (s *Service) Reprocess(ctx context.Context, id string) error {
-	if err := s.rag.Delete(ctx, rag.Filter{Source: id}); err != nil {
+	if err := s.lore.Vec.Delete(ctx, rag.Filter{Source: id}); err != nil {
 		return err
 	}
+	s.st.SetChapters(id, nil) // its map entries are rebuilt once it's read again
 	if err := s.st.UpdateSourceStatus(id, "queued", "", ""); err != nil {
 		return err
 	}
@@ -100,7 +165,13 @@ func (s *Service) DeleteSource(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.rag.Delete(ctx, rag.Filter{Source: id}); err != nil {
+	// A summary in progress included this document: stop it, it restarts without it.
+	s.mu.Lock()
+	if c := s.cancels["kb:"+src.KBID]; c != nil {
+		c()
+	}
+	s.mu.Unlock()
+	if err := s.lore.Vec.Delete(ctx, rag.Filter{Source: id}); err != nil {
 		return err
 	}
 	os.RemoveAll(filepath.Join(s.pagesDir, id))
@@ -108,8 +179,18 @@ func (s *Service) DeleteSource(ctx context.Context, id string) error {
 	return s.st.DeleteSource(id)
 }
 
+// loop works through the queue: source ids to read and embed, and "kb:<id>"
+// (or "kb!:<id>" to start over) to summarize a work.
 func (s *Service) loop() {
 	for id := range s.queue {
+		if kbID, ok := strings.CutPrefix(id, "kb:"); ok {
+			s.runKB(kbID, false)
+			continue
+		}
+		if kbID, ok := strings.CutPrefix(id, "kb!:"); ok {
+			s.runKB(kbID, true)
+			continue
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		s.mu.Lock()
 		s.cancels[id] = cancel
@@ -124,6 +205,10 @@ func (s *Service) loop() {
 		s.mu.Lock()
 		delete(s.cancels, id)
 		s.mu.Unlock()
+		// Once the work has nothing left to read, summarize it in one pass.
+		if src, err := s.st.Source(id); err == nil {
+			s.runKB(src.KBID, false)
+		}
 	}
 }
 
@@ -146,6 +231,10 @@ type page struct {
 	ImagePath string `json:"image_path"`
 }
 
+// process is the reading step for one document: extract its pages and have
+// the vision model read every comic page. Nothing is embedded yet: embedding
+// waits until every queued document of the work has been read (embedKB), and
+// the summary comes after that (summarizeKB).
 func (s *Service) process(ctx context.Context, id string) error {
 	src, err := s.st.Source(id)
 	if err != nil {
@@ -155,12 +244,7 @@ func (s *Service) process(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	sp, err := s.spaces(kb.ID)
-	if err != nil {
-		return err
-	}
 	opts := s.opts()
-	title := kb.Name
 
 	// 1. Extract
 	s.status(id, "extracting", "Đang đọc tài liệu…", "")
@@ -168,7 +252,7 @@ func (s *Service) process(ctx context.Context, id string) error {
 		Pages []page `json:"pages"`
 	}
 	err = s.w.Call(ctx, "doc.extract", map[string]any{
-		"path": src.Path, "out_dir": filepath.Join(s.pagesDir, id), "min_chars": 80, "max_side": 1400,
+		"path": src.Path, "out_dir": filepath.Join(s.pagesDir, id), "min_chars": 80, "max_side": max(opts.VisionMaxSide, 512),
 	}, &ex)
 	if err != nil {
 		return err
@@ -185,127 +269,69 @@ func (s *Service) process(ctx context.Context, id string) error {
 		}
 	}
 
-	// 2. Comic pages
+	// 2. Comic pages: the vision model reads every one of them, one per call.
 	mode := src.ComicMode
-	if len(imagePages) > 0 && (mode == "embed" || mode == "both") {
-		s.status(id, "embedding", fmt.Sprintf("Embedding %d trang ảnh…", len(imagePages)), "")
-		docs := make([]rag.ImageDoc, len(imagePages))
-		for i, p := range imagePages {
-			docs[i] = rag.ImageDoc{ID: fmt.Sprintf("%s:img:%d", id, p.Index), ImagePath: p.ImagePath,
-				Metadata: meta(src, rag.LevelRaw, strconv.Itoa(p.Index+1), "")}
-		}
-		if err := s.rag.AddImages(ctx, docs); err != nil {
-			return err
-		}
-	}
 	if len(imagePages) > 0 && (mode == "vision" || mode == "both") {
-		described, err := s.describePages(ctx, id, kb.VisionProvider, title, imagePages, opts)
+		described, err := s.describePages(ctx, id, kb.VisionProvider, kb.Name, imagePages, opts)
 		if err != nil {
 			return err
 		}
 		units = append(units, described...)
 		sortUnits(units)
 	}
-
-	if len(units) == 0 {
-		if len(imagePages) > 0 {
-			s.status(id, "done", fmt.Sprintf("Đã embed %d trang ảnh (không có văn bản để tóm tắt)", len(imagePages)), "")
-			return nil
-		}
+	var clip []page // pages to embed as images (no tokens), later with the rest
+	if mode == "embed" || mode == "both" {
+		clip = imagePages
+	}
+	if len(units) == 0 && len(clip) == 0 {
 		return fmt.Errorf("không trích xuất được nội dung nào từ tài liệu")
 	}
 
-	paras := paragraphs(units)
+	// Keep what was read for the embedding and summary steps.
+	if err := saveJSON(s.textPath(id), units); err != nil {
+		return err
+	}
+	if err := saveJSON(s.imagesPath(id), clip); err != nil {
+		return err
+	}
+	s.status(id, "read", fmt.Sprintf("%d trang · đã đọc, chờ embedding cùng cả bộ truyện", len(ex.Pages)), "")
+	return nil
+}
 
-	// 3. Raw chunks
-	if opts.KeepRaw {
-		chunks := pack(paras, opts.ChunkChars, opts.ChunkChars/8)
-		s.status(id, "embedding", fmt.Sprintf("Embedding %d đoạn gốc…", len(chunks)), "")
+// embedSource embeds one read document: its text chunks, and its comic pages
+// as images when that mode is on. A document with no text is then done.
+func (s *Service) embedSource(ctx context.Context, src store.Source, sp rag.Space, opts Options) (hasText bool, err error) {
+	units, err := loadUnits(s.textPath(src.ID))
+	if err != nil {
+		return false, err
+	}
+	var clip []page
+	if b, err := os.ReadFile(s.imagesPath(src.ID)); err == nil {
+		json.Unmarshal(b, &clip)
+	}
+	if len(clip) > 0 {
+		s.status(src.ID, "embedding", fmt.Sprintf("Embedding %d trang ảnh…", len(clip)), "")
+		docs := make([]rag.ImageDoc, len(clip))
+		for i, p := range clip {
+			docs[i] = rag.ImageDoc{ID: fmt.Sprintf("%s:img:%d", src.ID, p.Index), ImagePath: p.ImagePath,
+				Metadata: meta(src, rag.LevelRaw, strconv.Itoa(p.Index+1), "")}
+		}
+		if err := s.rag.AddImages(ctx, docs); err != nil {
+			return false, err
+		}
+	}
+	if len(units) > 0 && opts.KeepRaw {
+		chunks := pack(paragraphs(units), opts.ChunkChars, opts.ChunkChars/8)
+		s.status(src.ID, "embedding", fmt.Sprintf("Embedding %d đoạn…", len(chunks)), "")
 		docs := make([]rag.Doc, len(chunks))
 		for i, c := range chunks {
-			docs[i] = rag.Doc{ID: fmt.Sprintf("%s:raw:%d", id, i), Text: c.Text, Metadata: meta(src, rag.LevelRaw, c.pages(), "")}
+			docs[i] = rag.Doc{ID: fmt.Sprintf("%s:raw:%d", src.ID, i), Text: c.Text, Metadata: meta(src, rag.LevelRaw, c.pages(), "")}
 		}
-		if err := s.rag.AddTexts(ctx, sp, docs); err != nil {
-			return err
+		if err := s.lore.Vec.AddTexts(ctx, sp, docs); err != nil {
+			return false, err
 		}
 	}
-
-	// 4. Section summaries + entities
-	summarizer, err := s.resolve(llm.RoleSummarize, kb.LLMProvider)
-	if err != nil {
-		return err
-	}
-	sections := pack(paras, opts.SectionChars, 0)
-	results := make([]sectionResult, len(sections))
-	var done int
-	var mu sync.Mutex
-	err = parallel(ctx, len(sections), opts.Concurrency, func(i int) error {
-		r, err := s.summarizeSection(ctx, summarizer, title, i, len(sections), sections[i].Text)
-		if err != nil {
-			return fmt.Errorf("tóm tắt phần %d: %w", i+1, err)
-		}
-		results[i] = r
-		mu.Lock()
-		done++
-		s.status(id, "summarizing", fmt.Sprintf("Tóm tắt %d/%d phần…", done, len(sections)), "")
-		mu.Unlock()
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	var docs []rag.Doc
-	summaries := make([]string, len(sections))
-	for i, r := range results {
-		summaries[i] = fmt.Sprintf("(Phần %d, tr. %s) %s", i+1, sections[i].pages(), r.Summary)
-		docs = append(docs, rag.Doc{ID: fmt.Sprintf("%s:sec:%d", id, i), Text: r.Summary,
-			Metadata: meta(src, rag.LevelSection, sections[i].pages(), "")})
-	}
-
-	// 5. Entity profiles, merged across sections
-	s.status(id, "summarizing", "Tổng hợp hồ sơ nhân vật & địa danh…", "")
-	entities := mergeEntities(results)
-	err = parallel(ctx, len(entities), opts.Concurrency, func(i int) error {
-		e := entities[i]
-		if len(e.notes) > 1 && totalLen(e.notes) > 1200 {
-			merged, err := llm.Complete(ctx, summarizer, llm.Request{Purpose: "gộp hồ sơ " + e.Name, System: analystSystem, MaxTokens: 6000,
-				Messages: []llm.Message{llm.TextMessage(llm.RoleUser,
-					fmt.Sprintf(entityMergePrompt, e.Name, e.Type, title, strings.Join(e.notes, "\n---\n")))}})
-			if err != nil {
-				return err
-			}
-			e.profile = strings.TrimSpace(merged)
-		} else {
-			e.profile = strings.Join(e.notes, "\n")
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	for i, e := range entities {
-		docs = append(docs, rag.Doc{ID: fmt.Sprintf("%s:ent:%d", id, i),
-			Text:     fmt.Sprintf("%s (%s): %s", e.Name, e.Type, e.profile),
-			Metadata: meta(src, rag.LevelEntity, "", e.Name)})
-	}
-
-	// 6. Overview (hierarchical reduce)
-	s.status(id, "summarizing", "Viết tổng quan toàn bộ tác phẩm…", "")
-	overview, err := s.reduce(ctx, summarizer, title, summaries)
-	if err != nil {
-		return err
-	}
-	docs = append(docs, rag.Doc{ID: id + ":overview", Text: overview, Metadata: meta(src, rag.LevelOverview, "", "")})
-
-	s.status(id, "embedding", fmt.Sprintf("Embedding %d tóm tắt & hồ sơ…", len(docs)), "")
-	if err := s.rag.AddTexts(ctx, sp, docs); err != nil {
-		return err
-	}
-	s.refreshKBOverview(src.KBID, sp, id, overview)
-
-	s.status(id, "done", fmt.Sprintf("%d trang · %d phần · %d hồ sơ", len(ex.Pages), len(sections), len(entities)), "")
-	return nil
+	return len(units) > 0, nil
 }
 
 func meta(src store.Source, level, pages, name string) map[string]any {
@@ -319,25 +345,30 @@ func meta(src store.Source, level, pages, name string) map[string]any {
 	return m
 }
 
-// refreshKBOverview keeps the KB's display overview in sync. With several
-// sources it simply concatenates per-source overviews.
-func (s *Service) refreshKBOverview(kbID string, sp rag.Space, sourceID, overview string) {
-	srcs, _ := s.st.Sources(kbID)
-	if len(srcs) <= 1 {
-		s.st.SetKBOverview(kbID, overview)
-		return
+// textPath is where a source's text is kept: for the embedding and map
+// steps, and for read_chapter.
+func (s *Service) textPath(id string) string {
+	return lore.TextPath(s.pagesDir, id)
+}
+
+// imagesPath lists the comic pages of a source to embed as images.
+func (s *Service) imagesPath(id string) string {
+	return filepath.Join(s.pagesDir, id, "images.json")
+}
+
+func saveJSON(path string, v any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
-	hits, err := s.rag.GetTexts(context.Background(), sp, rag.Filter{KBIDs: []string{kbID}, Levels: []string{rag.LevelOverview}}, 50)
+	b, err := json.Marshal(v)
 	if err != nil {
-		return
+		return err
 	}
-	parts := []string{overview}
-	for _, h := range hits {
-		if h.Str("source_id") != sourceID {
-			parts = append(parts, h.Text)
-		}
-	}
-	s.st.SetKBOverview(kbID, strings.Join(parts, "\n\n---\n\n"))
+	return os.WriteFile(path, b, 0o644)
+}
+
+func loadUnits(path string) ([]unit, error) {
+	return lore.LoadPages(path)
 }
 
 type sectionResult struct {
@@ -349,45 +380,9 @@ type sectionResult struct {
 	} `json:"entities"`
 }
 
-func (s *Service) summarizeSection(ctx context.Context, p llm.Provider, title string, i, n int, text string) (sectionResult, error) {
-	out, err := llm.Complete(ctx, p, llm.Request{Purpose: fmt.Sprintf("tóm tắt %s · phần %d/%d", title, i+1, n), System: analystSystem, MaxTokens: 10000,
-		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, fmt.Sprintf(sectionPrompt, i+1, n, title, text))}})
-	if err != nil {
-		return sectionResult{}, err
-	}
-	var r sectionResult
-	if err := ParseJSON(out, &r); err != nil || r.Summary == "" {
-		r = sectionResult{Summary: strings.TrimSpace(out)} // model ignored the format; keep the prose
-	}
-	return r, nil
-}
-
-// reduce collapses section summaries into one overview, in rounds if needed.
-func (s *Service) reduce(ctx context.Context, p llm.Provider, title string, summaries []string) (string, error) {
-	const budget = 60000
-	for {
-		groups := groupByLen(summaries, budget)
-		next := make([]string, len(groups))
-		err := parallel(ctx, len(groups), 3, func(i int) error {
-			out, err := llm.Complete(ctx, p, llm.Request{Purpose: "tổng quan " + title, System: analystSystem, MaxTokens: 10000,
-				Messages: []llm.Message{llm.TextMessage(llm.RoleUser, fmt.Sprintf(reducePrompt, title, strings.Join(groups[i], "\n\n")))}})
-			next[i] = strings.TrimSpace(out)
-			return err
-		})
-		if err != nil {
-			return "", err
-		}
-		if len(next) == 1 {
-			return next[0], nil
-		}
-		summaries = next
-	}
-}
-
-var pageMarker = regexp.MustCompile(`(?m)^\s*=+\s*PAGE\s+(\d+)\s*=+\s*$`)
-
-// describePages sends comic pages to the vision model in small batches and
-// turns its transcription into text units (one-time token cost per page).
+// describePages has the vision model transcribe comic pages, one page per
+// call (a page always fits the context; many run in parallel), with thinking
+// off: a transcription needs eyes, not reasoning.
 func (s *Service) describePages(ctx context.Context, id, providerID, title string, pages []page, opts Options) ([]unit, error) {
 	vision, err := s.resolve(llm.RoleVision, providerID)
 	if err != nil {
@@ -396,30 +391,28 @@ func (s *Service) describePages(ctx context.Context, id, providerID, title strin
 	if !vision.SupportsVision() {
 		return nil, fmt.Errorf("provider cho vai trò 'vision' chưa bật hỗ trợ ảnh")
 	}
-	batch := max(opts.VisionBatch, 1)
-	nb := (len(pages) + batch - 1) / batch
-	out := make([][]unit, nb)
+	maxTokens, _ := llm.Budget(vision, 4000)
+	out := make([]unit, len(pages))
 	var done int
 	var mu sync.Mutex
-	err = parallel(ctx, nb, opts.Concurrency, func(b int) error {
-		group := pages[b*batch : min((b+1)*batch, len(pages))]
-		first, last := group[0].Index+1, group[len(group)-1].Index+1
-		parts := []llm.Part{{Text: fmt.Sprintf(visionPrompt, first, last, title)}}
-		for _, p := range group {
-			data, err := os.ReadFile(p.ImagePath)
-			if err != nil {
-				return err
-			}
-			parts = append(parts, llm.Part{Text: fmt.Sprintf("Page %d:", p.Index+1)},
-				llm.Part{ImageB64: base64.StdEncoding.EncodeToString(data), ImageMIME: mimeOf(p.ImagePath)})
-		}
-		text, err := llm.Complete(ctx, vision, llm.Request{Purpose: fmt.Sprintf("đọc truyện tranh %s · trang %d-%d", title, first, last), MaxTokens: 12000, Messages: []llm.Message{{Role: llm.RoleUser, Parts: parts}}})
+	err = parallel(ctx, len(pages), opts.Concurrency, func(i int) error {
+		p := pages[i]
+		data, err := os.ReadFile(p.ImagePath)
 		if err != nil {
-			return fmt.Errorf("đọc trang %d-%d: %w", first, last, err)
+			return err
 		}
-		out[b] = splitPages(text, group)
+		n := strconv.Itoa(p.Index + 1)
+		text, err := llm.Complete(ctx, vision, llm.Request{Purpose: fmt.Sprintf("đọc truyện tranh %s · trang %s", title, n), MaxTokens: maxTokens,
+			Messages: []llm.Message{{Role: llm.RoleUser, Parts: []llm.Part{
+				{Text: prompts.Get("vision", "page", n, "title", title)},
+				{ImageB64: base64.StdEncoding.EncodeToString(data), ImageMIME: mimeOf(p.ImagePath)},
+			}}}})
+		if err != nil {
+			return fmt.Errorf("đọc trang %s: %w", n, err)
+		}
+		out[i] = unit{Page: p.Index + 1, Text: strings.TrimSpace(text)}
 		mu.Lock()
-		done += len(group)
+		done++
 		s.status(id, "reading", fmt.Sprintf("Đọc trang truyện tranh %d/%d…", done, len(pages)), "")
 		mu.Unlock()
 		return nil
@@ -427,31 +420,13 @@ func (s *Service) describePages(ctx context.Context, id, providerID, title strin
 	if err != nil {
 		return nil, err
 	}
-	var units []unit
+	units := out[:0]
 	for _, u := range out {
-		units = append(units, u...)
+		if u.Text != "" {
+			units = append(units, u)
+		}
 	}
 	return units, nil
-}
-
-func splitPages(text string, group []page) []unit {
-	locs := pageMarker.FindAllStringSubmatchIndex(text, -1)
-	if len(locs) == 0 {
-		return []unit{{Page: group[0].Index + 1, Text: strings.TrimSpace(text)}}
-	}
-	var units []unit
-	for i, loc := range locs {
-		n, _ := strconv.Atoi(text[loc[2]:loc[3]])
-		end := len(text)
-		if i+1 < len(locs) {
-			end = locs[i+1][0]
-		}
-		body := strings.TrimSpace(text[loc[1]:end])
-		if body != "" {
-			units = append(units, unit{Page: n, Text: body})
-		}
-	}
-	return units
 }
 
 // ---- helpers ----

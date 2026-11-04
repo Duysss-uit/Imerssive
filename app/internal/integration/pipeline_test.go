@@ -19,6 +19,7 @@ import (
 	"immersive/internal/config"
 	"immersive/internal/ingest"
 	"immersive/internal/llm"
+	"immersive/internal/lore"
 	"immersive/internal/rag"
 	"immersive/internal/store"
 	"immersive/internal/worker"
@@ -43,7 +44,7 @@ func (f *fakeLLM) Stream(_ context.Context, r llm.Request, onDelta func(string))
 	var out string
 	switch {
 	case strings.Contains(prompt, "comic/manga"):
-		out = "=== PAGE 3 ===\nMột trang toàn màu đỏ, Lâm Phong hét lên: \"Mai Linh!\""
+		out = "Characters: Lâm Phong\nPanels:\n1. Một trang toàn màu đỏ.\n   Lâm Phong: \"Mai Linh!\""
 	case strings.Contains(prompt, `"entities"`):
 		out = "```json\n" + `{"summary":"Ma tộc tấn công làng Thanh Vân; Mai Linh bị bắt tới núi Hắc Sơn.",
 		"entities":[{"name":"Mai Linh","type":"character","description":"Thanh mai trúc mã của Lâm Phong, bị bắt tới núi Hắc Sơn."},
@@ -52,8 +53,6 @@ func (f *fakeLLM) Stream(_ context.Context, r llm.Request, onDelta func(string))
 		out = `{"name":"Lâm Phong","tagline":"Kiếm sĩ làng Thanh Vân","greeting":"*rút kiếm* Ai đó?"}`
 	case strings.Contains(prompt, "long-term memory"):
 		out = "- Đã nói chuyện về Mai Linh"
-	case strings.Contains(prompt, "overview"):
-		out = "Tổng quan: câu chuyện về Lâm Phong đi cứu Mai Linh."
 	default:
 		out = "*nắm chặt kiếm* Mai Linh đang ở núi Hắc Sơn."
 	}
@@ -101,15 +100,16 @@ func TestPipeline(t *testing.T) {
 	os.MkdirAll(filepath.Join(tmp, "src"), 0o755)
 	os.MkdirAll(filepath.Join(tmp, "pages"), 0o755)
 	ing := ingest.New(st, w, r, local, resolve, func() ingest.Options {
-		return ingest.Options{SectionChars: 4000, ChunkChars: 800, KeepRaw: true, Concurrency: 2, VisionBatch: 4}
+		return ingest.Options{ChapterChars: 4000, ChunkChars: 800, KeepRaw: true, Concurrency: 2, VisionMaxSide: 1024}
 	}, filepath.Join(tmp, "src"), filepath.Join(tmp, "pages"), emit)
 
 	kb := store.KnowledgeBase{Name: "Huyết Long Kiếm"}
 	st.SaveKnowledgeBase(&kb)
-	src, err := ing.AddSource(kb.ID, pdf, "both")
+	added, err := ing.AddSources(kb.ID, []string{pdf}, "both")
 	if err != nil {
 		t.Fatal(err)
 	}
+	src := added[0]
 
 	deadline := time.After(5 * time.Minute)
 wait:
@@ -138,7 +138,7 @@ wait:
 		levels[h.Str("level")]++
 	}
 	t.Logf("levels: %v", levels)
-	for _, lv := range []string{rag.LevelRaw, rag.LevelSection, rag.LevelEntity, rag.LevelOverview} {
+	for _, lv := range []string{rag.LevelRaw, rag.LevelSection, rag.LevelEntity} {
 		if levels[lv] == 0 {
 			t.Errorf("no %s documents stored", lv)
 		}
@@ -148,7 +148,10 @@ wait:
 		t.Errorf("image search: %v %v", imgs, err)
 	}
 	if kb2, _ := st.KnowledgeBase(kb.ID); kb2.Overview == "" {
-		t.Error("KB overview not set")
+		t.Error("story map not set")
+	}
+	if chs, _ := st.Chapters(kb.ID); len(chs) == 0 || chs[0].Summary == "" {
+		t.Errorf("chapters = %+v", chs)
 	}
 
 	// Character generation
@@ -159,7 +162,8 @@ wait:
 	st.SaveCharacter(&c)
 
 	// Chat turn: retrieved memory must be attached to the last user message
-	eng := chat.New(st, r, local, resolve, func() chat.Options {
+	lr := &lore.Lore{St: st, Vec: r, Spaces: local, PagesDir: filepath.Join(tmp, "pages")}
+	eng := chat.New(st, r, lr, local, resolve, func() chat.Options {
 		return chat.Options{RAGK: 6, ContextChars: 8000, Window: 40, MaxTokens: 512}
 	}, emit)
 	ch := store.Chat{CharacterID: c.ID, PersonaName: "Tiểu Vũ"}
@@ -184,8 +188,8 @@ wait:
 	if !strings.Contains(lastParts[0].Text, "<memory>") || !strings.Contains(lastParts[0].Text, "Hắc Sơn") {
 		t.Errorf("memory not attached: %q", lastParts[0].Text)
 	}
-	if strings.Contains(req.System, "Hắc Sơn") || !strings.Contains(req.System, "Lâm Phong") {
-		t.Error("system prompt should hold the card but not retrieved memory")
+	if !strings.Contains(req.System, "<story_map>") || !strings.Contains(req.System, "Lâm Phong") || strings.Contains(req.System, "<memory>") {
+		t.Error("system prompt should hold the card and the story map but not retrieved memory")
 	}
 	msgs, _ := st.Messages(ch.ID, false)
 	if len(msgs) != 3 || msgs[2].Role != "assistant" {

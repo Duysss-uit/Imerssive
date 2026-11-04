@@ -17,6 +17,17 @@ CHROMA_DIR = os.environ.get("IMM_CHROMA_DIR") or os.path.join(os.getcwd(), ".chr
 
 _lock = threading.Lock()
 _client = None
+_version = 0  # bumped on every write, so derived indexes (BM25) know to rebuild
+
+
+def version() -> int:
+    return _version
+
+
+def _changed():
+    global _version
+    with _lock:
+        _version += 1
 
 
 def _db():
@@ -66,6 +77,7 @@ def add_texts(items: list, space: str = "", embeddings: list = None) -> dict:
         documents=[it["text"] for it in items],
         metadatas=[_clean_meta(it.get("metadata")) for it in items],
     )
+    _changed()
     return {"added": len(items)}
 
 
@@ -119,9 +131,11 @@ def delete(where=None, space: str = "", only_space: bool = False) -> dict:
         raise ValueError("refusing to delete without a filter")
     if only_space:
         _col("text", space).delete(where=where)
+        _changed()
         return {"ok": True}
     db = _db()
     for c in db.list_collections():
         name = c if isinstance(c, str) else c.name
         db.get_collection(name, embedding_function=None).delete(where=where)
+    _changed()
     return {"ok": True}

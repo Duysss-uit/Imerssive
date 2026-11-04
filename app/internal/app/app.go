@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -21,6 +24,8 @@ import (
 	"immersive/internal/config"
 	"immersive/internal/ingest"
 	"immersive/internal/llm"
+	"immersive/internal/lore"
+	"immersive/internal/prompts"
 	"immersive/internal/rag"
 	"immersive/internal/secrets"
 	"immersive/internal/store"
@@ -29,25 +34,26 @@ import (
 
 // Defaults for every setting the UI can change.
 var defaultSettings = map[string]string{
-	"provider.chat":        "",
-	"provider.summarize":   "", // empty = same as chat
-	"provider.vision":      "", // empty = same as chat
-	"embed.text_model":     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-	"embed.image_model":    "Qdrant/clip-ViT-B-32-vision",
-	"ingest.section_chars": "16000",
-	"ingest.chunk_chars":   "1500",
-	"ingest.keep_raw":      "true",
-	"ingest.concurrency":   "3",
-	"ingest.vision_batch":  "4",
-	"chat.rag_k":           "8",
-	"chat.context_chars":   "10000",
-	"chat.window":          "40",
-	"chat.max_tokens":      "6000",
-	"chat.attach_images":   "false",
-	"chat.image_k":         "2",
-	"worker.idle_minutes":  "5",
-	"worker.python":        "",               // empty = auto-detect worker/.venv
-	"log.model":            applog.ModelFull, // full | response | off
+	"provider.chat":          "",
+	"provider.summarize":     "", // empty = same as chat
+	"provider.vision":        "", // empty = same as chat
+	"embed.text_model":       "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+	"embed.image_model":      "Qdrant/clip-ViT-B-32-vision",
+	"ingest.chapter_chars":   "40000",
+	"ingest.chunk_chars":     "1500",
+	"ingest.keep_raw":        "true",
+	"ingest.concurrency":     "3",
+	"ingest.vision_max_side": "1024",
+	"chat.rag_k":             "8",
+	"chat.context_chars":     "10000",
+	"chat.window":            "40",
+	"chat.max_tokens":        "6000",
+	"chat.attach_images":     "false",
+	"chat.image_k":           "2",
+	"chat.divergence_every":  "3",
+	"worker.idle_minutes":    "5",
+	"worker.python":          "",               // empty = auto-detect worker/.venv
+	"log.model":              applog.ModelFull, // full | response | off
 }
 
 type App struct {
@@ -59,6 +65,14 @@ type App struct {
 	rag    *rag.Store
 	ingest *ingest.Service
 	chat   *chat.Engine
+
+	ctxMu  sync.Mutex
+	ctxWin map[string]detected // provider id + model → detected context window
+}
+
+type detected struct {
+	tokens int
+	at     time.Time
 }
 
 func New() (*App, error) {
@@ -71,17 +85,29 @@ func New() (*App, error) {
 		return nil, err
 	}
 	log.Printf("app: khởi động, dữ liệu tại %s", paths.DataDir)
+	// Prompts live next to the app so they are easy to find and edit; the data
+	// folder is the fallback when the app's folder isn't writable.
+	var promptDirs []string
+	if exe, err := os.Executable(); err == nil {
+		promptDirs = append(promptDirs, filepath.Join(filepath.Dir(exe), "prompts"))
+	}
+	if d, err := prompts.Init(append(promptDirs, filepath.Join(paths.DataDir, "prompts"))...); err != nil {
+		log.Printf("app: không tạo được thư mục prompt, dùng prompt mặc định: %v", err)
+	} else {
+		log.Printf("app: prompt tại %s", d)
+	}
 	st, err := store.Open(paths.DB)
 	if err != nil {
 		return nil, err
 	}
 	st.MarkInterruptedSources()
 
-	a := &App{paths: paths, st: st, logs: logs}
+	a := &App{paths: paths, st: st, logs: logs, ctxWin: map[string]detected{}}
 	a.w = worker.New(a.workerOptions())
 	a.rag = rag.New(a.w)
 	a.ingest = ingest.New(st, a.w, a.rag, a.space, a.resolve, a.ingestOptions, paths.Sources, paths.Pages, a.emit)
-	a.chat = chat.New(st, a.rag, a.space, a.resolve, a.chatOptions, a.emit)
+	lr := &lore.Lore{St: st, Vec: a.rag, Spaces: a.space, PagesDir: paths.Pages}
+	a.chat = chat.New(st, a.rag, lr, a.space, a.resolve, a.chatOptions, a.emit)
 	return a, nil
 }
 
@@ -136,11 +162,11 @@ func (a *App) workerOptions() worker.Options {
 
 func (a *App) ingestOptions() ingest.Options {
 	return ingest.Options{
-		SectionChars: a.intSetting("ingest.section_chars"),
-		ChunkChars:   a.intSetting("ingest.chunk_chars"),
-		KeepRaw:      a.setting("ingest.keep_raw") == "true",
-		Concurrency:  a.intSetting("ingest.concurrency"),
-		VisionBatch:  a.intSetting("ingest.vision_batch"),
+		ChapterChars:  a.intSetting("ingest.chapter_chars"),
+		ChunkChars:    a.intSetting("ingest.chunk_chars"),
+		KeepRaw:       a.setting("ingest.keep_raw") == "true",
+		Concurrency:   a.intSetting("ingest.concurrency"),
+		VisionMaxSide: a.intSetting("ingest.vision_max_side"),
 	}
 }
 
@@ -152,6 +178,8 @@ func (a *App) chatOptions() chat.Options {
 		MaxTokens:    a.intSetting("chat.max_tokens"),
 		AttachImages: a.setting("chat.attach_images") == "true",
 		ImageK:       a.intSetting("chat.image_k"),
+
+		DivergenceEvery: a.intSetting("chat.divergence_every"),
 	}
 }
 
@@ -248,7 +276,50 @@ func (a *App) DeleteProvider(id string) error {
 
 func (a *App) configFor(p store.Provider, key string) llm.Config {
 	return llm.Config{Kind: llm.Kind(p.Kind), BaseURL: p.BaseURL, Model: p.Model, APIKey: key,
-		Vision: p.Vision, Temperature: p.Temperature, Effort: p.Effort, NoThinking: p.Thinking == "off"}
+		Vision: p.Vision, Temperature: p.Temperature, Effort: p.Effort, NoThinking: p.Thinking == "off", ContextWindow: p.ContextWindow}
+}
+
+// contextWindow is the context length prompts for p are sized to: the one
+// the user set, else what the server reports (asked at most every 10
+// minutes, as a local model may be reloaded with another length), else a
+// cautious default.
+func (a *App) contextWindow(p store.Provider, key string) int {
+	if p.ContextWindow > 0 {
+		return p.ContextWindow
+	}
+	id := p.ID + "\x00" + p.Model
+	a.ctxMu.Lock()
+	d, ok := a.ctxWin[id]
+	a.ctxMu.Unlock()
+	if !ok || time.Since(d.at) > 10*time.Minute {
+		d = detected{tokens: llm.DetectContext(context.Background(), a.configFor(p, key)), at: time.Now()}
+		a.ctxMu.Lock()
+		a.ctxWin[id] = d
+		a.ctxMu.Unlock()
+		if d.tokens > 0 {
+			log.Printf("provider: %q (%s) có ngữ cảnh %d token", p.Name, p.Model, d.tokens)
+		} else {
+			log.Printf("provider: %q (%s) không cho biết độ dài ngữ cảnh, dùng mặc định", p.Name, p.Model)
+		}
+	}
+	if d.tokens > 0 {
+		return d.tokens
+	}
+	if p.Kind == string(llm.KindLocal) {
+		return llm.DefaultContextLocal
+	}
+	return llm.DefaultContextRemote
+}
+
+// DetectContextWindow asks the server for the model's context length (0 = it doesn't say).
+func (a *App) DetectContextWindow(in ProviderInput) int {
+	key := in.APIKey
+	if key == "" && in.ID != "" {
+		key, _ = secrets.Get(in.ID)
+	}
+	n := llm.DetectContext(context.Background(), a.configFor(in.Provider, key))
+	log.Printf("provider: nhận diện ngữ cảnh %s → %d token", in.Model, n)
+	return n
 }
 
 // resolve returns provider id, or the one assigned to role in settings when id
@@ -276,7 +347,12 @@ func (a *App) provider(p store.Provider, role string) (llm.Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	prov, err := llm.New(a.configFor(p, key))
+	cfg := a.configFor(p, key)
+	cfg.ContextWindow = a.contextWindow(p, key)
+	if role == llm.RoleVision {
+		cfg.NoThinking = true // transcribing a page needs eyes, not reasoning
+	}
+	prov, err := llm.New(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -430,16 +506,16 @@ func (a *App) PickFiles() ([]string, error) {
 
 // AddSources queues files for ingestion. comicMode: vision | embed | both.
 func (a *App) AddSources(kbID string, paths []string, comicMode string) ([]store.Source, error) {
-	var out []store.Source
-	for _, p := range paths {
-		s, err := a.ingest.AddSource(kbID, p, comicMode)
-		if err != nil {
-			return out, fmt.Errorf("%s: %w", p, err)
-		}
-		log.Printf("library: thêm tài liệu %s (truyện tranh: %s)", p, comicMode)
-		out = append(out, s)
+	out, err := a.ingest.AddSources(kbID, paths, comicMode)
+	for _, s := range out {
+		log.Printf("library: thêm tài liệu %s (phần %d, truyện tranh: %s)", s.Filename, s.Seq, comicMode)
 	}
-	return out, nil
+	return out, err
+}
+
+// ResummarizeKB summarizes a work again from its first part, as one story.
+func (a *App) ResummarizeKB(kbID string) error {
+	return act(a.ingest.Resummarize(kbID), "library: tóm tắt lại bộ truyện %s từ đầu", kbID)
 }
 
 func (a *App) ReprocessSource(id string) error {
@@ -619,7 +695,28 @@ func (a *App) DeleteMessage(id int64) error {
 	return act(a.st.DeleteMessage(id), "chat: xoá tin nhắn %d", id)
 }
 
+// SetChatDivergence saves the player's version of a chat's divergence log.
+func (a *App) SetChatDivergence(chatID, text string) error {
+	return act(a.chat.SetDivergence(chatID, text), "chat: %s sửa sổ thay đổi", chatID)
+}
+
+// RefreshDivergence updates a chat's divergence log now.
+func (a *App) RefreshDivergence(chatID string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	out, err := a.chat.RefreshDivergence(ctx, chatID)
+	return out, act(err, "chat: %s cập nhật sổ thay đổi", chatID)
+}
+
 func (a *App) LogDir() string { return a.paths.Logs }
+
+// PromptsDir is the folder of editable prompt files.
+func (a *App) PromptsDir() string { return prompts.Dir() }
+
+// OpenPromptsDir shows the prompt folder in Explorer.
+func (a *App) OpenPromptsDir() error {
+	return exec.Command("explorer", prompts.Dir()).Start()
+}
 
 // OpenLogDir shows the log folder in Explorer.
 func (a *App) OpenLogDir() error {

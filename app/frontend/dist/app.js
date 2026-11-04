@@ -484,7 +484,7 @@ $("#new-scenario").onclick = () => editScenario();
 
 // ---------- library ----------
 const BUSY = ["queued", "extracting", "reading", "summarizing", "embedding"];
-const STATUS_LABEL = { queued: "Chờ", extracting: "Đọc file", reading: "Đọc tranh", summarizing: "Tóm tắt", embedding: "Embedding", done: "Xong", error: "Lỗi" };
+const STATUS_LABEL = { queued: "Chờ", extracting: "Đọc file", reading: "Đọc tranh", read: "Chờ embedding", embedding: "Embedding", embedded: "Chờ lập bản đồ", summarizing: "Lập bản đồ", done: "Xong", error: "Lỗi" };
 // Suggested embedding model per provider kind (all served on /v1/embeddings).
 const EMBED_MODELS = {
   openai: "text-embedding-3-small",
@@ -515,7 +515,7 @@ async function renderKB(kb) {
   d.innerHTML = `
     <div class="card">
       <div class="card-head"><h2>${esc(kb.name)}</h2>
-        <div><button id="kb-play" class="primary">▶ Chơi ngay</button> <button id="kb-edit">Sửa</button> <button id="kb-del" class="danger ghost">Xoá</button></div></div>
+        <div><button id="kb-play" class="primary">▶ Chơi ngay</button> <button id="kb-resum" title="Lập lại bản đồ truyện và hồ sơ nhân vật từ phần đầu">↻ Lập lại bản đồ</button> <button id="kb-edit">Sửa</button> <button id="kb-del" class="danger ghost">Xoá</button></div></div>
       <div class="gen-row">
         <select id="comic-mode" style="flex:1;max-width:none">
           <option value="vision">Truyện tranh: đọc bằng vision LLM (chính xác, tốn token 1 lần)</option>
@@ -524,7 +524,7 @@ async function renderKB(kb) {
         </select>
         <button class="primary" id="add-files">+ Thêm tài liệu</button>
       </div>
-      <p class="muted small">Hỗ trợ PDF, EPUB, CBZ, TXT, MD, ảnh. Trang chữ được tóm tắt trực tiếp; trang tranh xử lý theo chế độ đã chọn.</p>
+      <p class="muted small">Hỗ trợ PDF, EPUB, CBZ, TXT, MD, ảnh. Cả bộ đi qua ba bước, bước sau chờ mọi tài liệu xong bước trước: đọc (vision đọc từng trang tranh, mỗi lần một trang) → embedding → lập bản đồ truyện theo thứ tự chương. Tài liệu thêm sau được nối tiếp vào bản đồ; nhiều file chọn cùng lúc được xếp theo tên (Chương 2 trước Chương 10).</p>
       <table><thead><tr><th>Tài liệu</th><th>Trạng thái</th><th></th></tr></thead><tbody id="src-rows"></tbody></table>
     </div>
     <div class="card">
@@ -543,7 +543,7 @@ async function renderKB(kb) {
       <datalist id="kb-embed-models"></datalist>
       <p class="muted small">Đổi embedding sẽ embedding lại toàn bộ văn bản đã lưu sang model mới (không gọi lại LLM). Claude không có API embedding.</p>
     </div>
-    <div class="card"><h2>Tổng quan (tự động)</h2><div class="overview">${esc(kb.overview) || '<span class="muted">Sẽ có sau khi xử lý xong tài liệu.</span>'}</div></div>
+    <div class="card"><h2>Bản đồ truyện (tự động)</h2><p class="muted small">Mỗi chương vài câu, theo thứ tự truyện. Khi chat, model đọc bản đồ này rồi tự tra chi tiết (hồ sơ nhân vật, nội dung và lời thoại từng chương).</p><div class="overview">${esc(kb.overview) || '<span class="muted">Sẽ có sau khi xử lý xong tài liệu.</span>'}</div></div>
     <div class="card"><h2>Thử truy xuất RAG</h2>
       <div class="gen-row"><input id="kb-q" placeholder="Hỏi gì đó về truyện…"><button id="kb-search">Tìm</button></div>
       <div id="kb-hits"></div></div>`;
@@ -590,6 +590,10 @@ async function renderKB(kb) {
     renderKB(kb);
   };
   $("#kb-play", d).onclick = () => quickPlayDialog([kb.id]);
+  $("#kb-resum", d).onclick = () => openModal(`<h2>Lập lại bản đồ “${esc(kb.name)}”?</h2>
+    <p class="muted">Model tóm tắt đọc lại toàn bộ tài liệu từ phần đầu, từng chương theo từng đoạn vừa với ngữ cảnh của nó, rồi viết lại bản đồ truyện và hồ sơ nhân vật. Bộ truyện nạp bằng bản cũ cần làm việc này một lần. Phần embedding giữ nguyên.</p>
+    <div class="modal-actions"><button value="cancel">Huỷ</button><button class="primary">Lập lại</button></div>`,
+    async () => { await api.ResummarizeKB(kb.id); toast("Đã xếp hàng lập lại bản đồ"); renderKB(kb); });
   $("#kb-edit", d).onclick = () => editKB(kb);
   $("#kb-del", d).onclick = () => openModal(`<h2>Xoá “${esc(kb.name)}”?</h2><p class="muted">Toàn bộ tài liệu và vector của bộ truyện này sẽ bị xoá.</p>
     <div class="modal-actions"><button value="cancel">Huỷ</button><button class="primary">Xoá</button></div>`,
@@ -690,9 +694,11 @@ async function loadSettings() {
     ? `Worker: ${ws.running ? "đang chạy" : "đang tắt (sẽ bật khi cần)"} · ${ws.python}`
     : "⚠ Không tìm thấy thư mục worker/ — xem README để cài đặt.";
   api.LogDir().then(d => ($("#log-dir").textContent = "Thư mục: " + d));
+  api.PromptsDir().then(d => ($("#prompt-dir").textContent = "Thư mục: " + d));
 }
 
 $("#open-logs").onclick = () => guard(() => api.OpenLogDir());
+$("#open-prompts").onclick = () => guard(() => api.OpenPromptsDir());
 
 $("#save-settings").onclick = async () => {
   const values = {};
@@ -716,7 +722,9 @@ function editProvider(p = { kind: "anthropic", temperature: 0, vision: false }) 
       <label class="effort">Effort (Claude)<select name="effort">${["", "low", "medium", "high", "xhigh", "max"].map(e => `<option value="${e}" ${e === (p.effort || "") ? "selected" : ""}>${e || "mặc định"}</option>`).join("")}</select></label>
     </div>
     <label class="check vision"><input type="checkbox" name="vision" ${p.vision ? "checked" : ""}> Model hỗ trợ đọc ảnh (vision)</label>
-    <label class="check no-think"><input type="checkbox" name="thinking" ${p.thinking === "off" ? "checked" : ""}> Tắt suy nghĩ (cho model suy luận như Qwen 3, Nemotron, DeepSeek: trả lời nhanh hơn, không tốn token suy nghĩ)</label>
+    <label class="check no-think"><input type="checkbox" name="thinking" ${p.thinking === "off" ? "checked" : ""}> Tắt suy nghĩ (cho model suy luận như Qwen 3, Nemotron, DeepSeek: trả lời nhanh hơn, không tốn token suy nghĩ). Khi đọc truyện tranh, vision luôn tắt suy nghĩ.</label>
+    <label>Context window (token) <small>— để trống: tự hỏi server (LM Studio, OpenRouter…), không được thì đoán ${"4096 cho local, 32768 cho API"}. Mọi prompt được cắt cho vừa con số này.</small>
+      <div class="gen-row"><input name="contextWindow" type="number" min="0" step="1024" value="${p.contextWindow || ""}" placeholder="tự nhận"><button type="button" id="detect-ctx">Nhận diện</button></div></label>
     <div class="modal-actions">
       ${p.id ? `<button value="delete" class="danger ghost" style="margin-right:auto">Xoá</button>` : ""}
       <button value="cancel">Huỷ</button><button value="save" class="primary">Lưu</button>
@@ -731,6 +739,7 @@ function editProvider(p = { kind: "anthropic", temperature: 0, vision: false }) 
     id: p.id || "", name: fd.get("name") || KINDS[fd.get("kind")].label, kind: fd.get("kind"), baseUrl: fd.get("baseUrl"),
     model: fd.get("model"), apiKey: fd.get("apiKey"), temperature: parseFloat(fd.get("temperature")) || 0,
     effort: fd.get("effort"), vision: fd.get("vision") === "on", thinking: fd.get("thinking") === "on" ? "off" : "",
+    contextWindow: parseInt(fd.get("contextWindow")) || 0,
   });
   const kindSel = $("[name=kind]", body);
   const sync = first => {
@@ -746,6 +755,11 @@ function editProvider(p = { kind: "anthropic", temperature: 0, vision: false }) 
   };
   kindSel.onchange = () => sync(false);
   sync(true);
+  $("#detect-ctx", body).onclick = async () => {
+    const n = await guard(() => api.DetectContextWindow(collect(new FormData(body))));
+    if (n) { $("[name=contextWindow]", body).value = n; toast(`Model có context ${n} token`); }
+    else toast("Server không cho biết — nhập tay (với LM Studio: xem Context Length khi nạp model)", true);
+  };
   $("#load-models", body).onclick = async () => {
     const models = await guard(() => api.ListModels(collect(new FormData(body))));
     $("#model-list", body).innerHTML = models.map(m => `<option value="${esc(m)}">`).join("");
@@ -844,6 +858,10 @@ function renderDrawer() {
     ${sub.scene && scen?.setting ? `<div class="d-sec"><h3>Bối cảnh</h3><p>${esc(scen.setting)}</p></div>` : ""}
     ${others.length ? `<div class="d-sec"><h3>Nhân vật do AI điều khiển</h3><p>${others.map(m => "• " + esc(m.name)).join("\n")}</p></div>` : ""}
     ${!sub.scene && ch?.description ? `<div class="d-sec"><h3>Mô tả</h3><p>${esc(ch.description)}</p></div>` : ""}
+    <div class="d-sec"><h3>Sổ thay đổi so với nguyên tác</h3>
+      <p class="muted small">Những gì câu chuyện này đã khác nguyên tác vì lựa chọn của bạn. Model tự cập nhật sau vài lượt; khi mâu thuẫn với nguyên tác, sổ này được ưu tiên.</p>
+      <p class="divergence">${chat.divergence ? esc(chat.divergence) : '<span class="muted">Chưa có gì khác nguyên tác.</span>'}</p>
+      <div class="d-row"><button data-a="div-edit">Sửa</button><button data-a="div-refresh">↻ Cập nhật ngay</button></div></div>
     <div class="d-sec"><h3>Lịch sử trò chuyện</h3><div class="hist">${history.map(c =>
       `<div class="hist-item ${c.id === chat.id ? "active" : ""}" data-id="${c.id}"><span>${esc(c.title || sub.name)}</span><span class="muted small">${new Date(c.updatedAt * 1000).toLocaleDateString("vi")}</span></div>`).join("")}</div></div>
     <div class="d-sec"><button data-a="delete" class="danger ghost" style="width:100%">Xoá cuộc trò chuyện này</button></div>`);
@@ -855,7 +873,37 @@ function renderDrawer() {
     if (a === "edit" && ch) editCharacter(ch, () => openChat(chat.id));
     if (a === "edit-scene" && scen) editScenario(scen);
     if (a === "delete") deleteChatDialog();
+    if (a === "div-edit") editDivergence(chat);
+    if (a === "div-refresh") refreshDivergence(chat, e.target.closest("button"));
   };
+}
+
+function setDivergence(chatId, text) {
+  const c = state.chats.find(x => x.id === chatId);
+  if (c) c.divergence = text;
+  if (state.chat?.id === chatId) { state.chat.divergence = text; if (!$("#chat-drawer").hidden) renderDrawer(); }
+}
+
+function editDivergence(chat) {
+  openModal(`<h2>Sổ thay đổi so với nguyên tác</h2>
+    <p class="muted small">Ghi những gì đúng trong câu chuyện của bạn mà khác nguyên tác: ai còn sống, quan hệ đã đổi, đang ở đâu… Model coi sổ này là sự thật và tiếp tục cập nhật nó.</p>
+    <textarea name="text" rows="14">${esc(chat.divergence || "")}</textarea>
+    <div class="modal-actions"><button value="cancel">Huỷ</button><button class="primary">Lưu</button></div>`,
+    async fd => {
+      const text = fd.get("text").trim();
+      await api.SetChatDivergence(chat.id, text);
+      setDivergence(chat.id, text);
+      toast("Đã lưu sổ thay đổi");
+    });
+}
+
+async function refreshDivergence(chat, btn) {
+  btn.disabled = true;
+  btn.textContent = "Đang cập nhật…";
+  try {
+    const text = await guard(() => api.RefreshDivergence(chat.id));
+    if (text != null) { setDivergence(chat.id, text); toast("Đã cập nhật sổ thay đổi"); }
+  } finally { btn.disabled = false; btn.textContent = "↻ Cập nhật ngay"; }
 }
 
 function deleteChatDialog() {
@@ -1019,6 +1067,17 @@ on("chat:thinking", ({ chatId }) => {
   const body = $$(".streaming .body").at(-1);
   if (body && !body.querySelector(".thinking")) body.innerHTML = `<span class="thinking">Đang suy nghĩ…</span>`;
 });
+// The model is looking the source up before it answers.
+const LOOKUP = { search_story: "tìm trong truyện", read_chapter: "đọc chương", get_character: "xem hồ sơ" };
+on("chat:lookup", ({ chatId, tool, args }) => {
+  if (chatId !== state.chatId || state.streaming[chatId]) return;
+  const body = $$(".streaming .body").at(-1);
+  if (!body) return;
+  let what = "";
+  try { const a = JSON.parse(args || "{}"); what = a.query || a.name || (a.chapter ? "chương " + a.chapter : ""); } catch { }
+  body.innerHTML = `<span class="thinking">Đang ${LOOKUP[tool] ?? "tra cứu"}${what ? ": " + esc(String(what)) : ""}…</span>`;
+});
+on("chat:divergence", ({ chatId, divergence }) => setDivergence(chatId, divergence));
 on("chat:done", ({ chatId }) => {
   delete state.streaming[chatId];
   if (chatId === state.chatId) { setStreaming(false); renderMessages(); }

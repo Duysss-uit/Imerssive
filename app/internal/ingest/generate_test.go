@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"immersive/internal/llm"
+	"immersive/internal/lore"
 	"immersive/internal/rag"
 	"immersive/internal/store"
 )
@@ -65,11 +66,14 @@ func newTestService(t *testing.T, p llm.Provider) (*Service, *fakeLookup, string
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	kb := store.KnowledgeBase{Name: "Truyện", Overview: "Lâm Phong đi cứu Mai Linh."}
+	kb := store.KnowledgeBase{Name: "Truyện"}
 	st.SaveKnowledgeBase(&kb)
+	src := store.Source{KBID: kb.ID, Filename: "c1.pdf", Status: "done"}
+	st.InsertSource(&src)
+	st.SetChapters(src.ID, []store.Chapter{{KBID: kb.ID, Title: "Chương 1", Pages: "1-5", Summary: "Lâm Phong đi cứu Mai Linh."}})
 	look := &fakeLookup{}
-	s := &Service{st: st, lookup: look,
-		spaces:  func(string) (rag.Space, error) { return rag.Space{}, nil },
+	spaces := func(string) (rag.Space, error) { return rag.Space{}, nil }
+	s := &Service{st: st, lore: &lore.Lore{St: st, Vec: look, Spaces: spaces}, spaces: spaces,
 		resolve: func(string, string) (llm.Provider, error) { return p, nil }}
 	return s, look, kb.ID
 }
@@ -85,13 +89,16 @@ func TestResearchWithTools(t *testing.T) {
 		t.Errorf("searches = %q", look.queries)
 	}
 	first := m.reqs[0].Messages[0].Parts[0].Text
-	for _, want := range []string{"Lâm Phong đi cứu Mai Linh", "Hắc Sơn (place)", "[Hồ sơ: Lâm Phong]", "search_story"} {
+	for _, want := range []string{"1. Chương 1 (tr. 1-5): Lâm Phong đi cứu Mai Linh", "Hắc Sơn (place)", "[Hồ sơ: Lâm Phong]", "search_story"} {
 		if !strings.Contains(first, want) {
 			t.Errorf("brief missing %q:\n%s", want, first)
 		}
 	}
 	if strings.Contains(first, "núi Hắc Sơn.") {
 		t.Error("search results should not be in the first prompt")
+	}
+	if len(m.reqs[0].Tools) != 3 {
+		t.Errorf("tools offered: %+v", m.reqs[0].Tools)
 	}
 	second := m.reqs[1].Messages
 	if res := second[len(second)-1]; res.Role != llm.RoleTool || res.CallID != "c1" || !strings.Contains(res.Parts[0].Text, "núi Hắc Sơn") {
@@ -115,14 +122,17 @@ func TestResearchWithoutTools(t *testing.T) {
 }
 
 func TestParseEntity(t *testing.T) {
-	e := parseEntity("Hina", "Hina (character): Teal hair: playful.")
+	e := lore.ParseEntity("Hina", "Hina (character): Teal hair: playful.")
 	if e.Name != "Hina" || e.Type != "character" || e.Profile != "Teal hair: playful." || !e.IsCharacter() {
 		t.Errorf("%+v", e)
 	}
-	if e := parseEntity("", "Hắc Sơn (place): núi"); e.Name != "Hắc Sơn" || e.IsCharacter() {
+	if e := lore.ParseEntity("", "Hắc Sơn (place): núi"); e.Name != "Hắc Sơn" || e.IsCharacter() {
 		t.Errorf("%+v", e)
 	}
 	if got := Shorten("Câu một. Câu hai dài hơn nhiều.", 15); got != "Câu một." {
 		t.Errorf("Shorten = %q", got)
 	}
 }
+
+func (f *fakeLookup) AddTexts(context.Context, rag.Space, []rag.Doc) error { return nil }
+func (f *fakeLookup) Delete(context.Context, rag.Filter) error             { return nil }

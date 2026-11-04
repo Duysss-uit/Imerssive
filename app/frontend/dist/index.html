@@ -104,10 +104,11 @@
             <label>Giới hạn ký tự ký ức/lượt<input data-setting="chat.context_chars" type="number" min="1000" step="1000"></label>
             <label>Cửa sổ tin nhắn trước khi nén<input data-setting="chat.window" type="number" min="6"></label>
             <label>Max tokens trả lời<input data-setting="chat.max_tokens" type="number" min="128"></label>
-            <label>Ký tự mỗi phần tóm tắt<input data-setting="ingest.section_chars" type="number" step="1000"></label>
+            <label>Ký tự tối đa mỗi chương trong bản đồ<input data-setting="ingest.chapter_chars" type="number" min="2000" step="1000"></label>
             <label>Ký tự mỗi đoạn gốc<input data-setting="ingest.chunk_chars" type="number" step="100"></label>
             <label>Số luồng LLM song song<input data-setting="ingest.concurrency" type="number" min="1" max="10"></label>
-            <label>Trang/lần gọi vision<input data-setting="ingest.vision_batch" type="number" min="1" max="10"></label>
+            <label>Cạnh dài ảnh gửi vision (px)<input data-setting="ingest.vision_max_side" type="number" min="512" max="2400" step="64"></label>
+            <label>Cập nhật sổ thay đổi sau (lượt, 0 = tắt)<input data-setting="chat.divergence_every" type="number" min="0" max="20"></label>
           </div>
           <label class="check"><input data-setting="ingest.keep_raw" type="checkbox"> Lưu cả văn bản gốc (ngoài bản tóm tắt) để trích dẫn chính xác</label>
           <label class="check"><input data-setting="chat.attach_images" type="checkbox"> Gửi kèm trang truyện tranh liên quan khi chat (tốn token ảnh)</label>
@@ -120,6 +121,11 @@
           <label>Python (để trống = tự tìm worker/.venv)<input data-setting="worker.python"></label>
           <p class="muted small" id="worker-status"></p>
           <p class="muted small">Mỗi bộ truyện có thể dùng embedding qua API thay cho model local: chọn trong Thư viện. Đổi model local ở đây cần xử lý lại các bộ truyện đang dùng local.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Prompt</h2><button id="open-prompts">Mở thư mục prompt</button></div>
+          <p class="muted small">Mọi prompt gửi cho model nằm trong các file .md ở thư mục này. Sửa file là có hiệu lực ngay ở lần gọi model tiếp theo, không cần khởi động lại. Xoá một file để quay về bản mặc định (app tạo lại khi mở). Đầu mỗi file có ghi chú giải thích công dụng và các biến dạng {title}.</p>
+          <p class="muted small" id="prompt-dir"></p>
         </div>
         <div class="card">
           <div class="card-head"><h2>Nhật ký (log)</h2><button id="open-logs">Mở thư mục log</button></div>

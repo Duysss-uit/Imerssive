@@ -162,7 +162,7 @@ td button { padding: 4px 10px; }
 .status.done { color: var(--ok); }
 .status.error { color: var(--danger); }
 .status.busy { color: var(--accent); }
-.overview { white-space: pre-wrap; max-height: 260px; overflow-y: auto; color: #d4d4d8; font-size: 13px; }
+.overview { white-space: pre-wrap; max-height: 420px; overflow-y: auto; color: #d4d4d8; font-size: 13px; }
 .hit { border-left: 3px solid var(--accent); padding: 6px 10px; margin: 8px 0; background: var(--bg); border-radius: 0 10px 10px 0; font-size: 13px; white-space: pre-wrap; }
 
 /* ---------- settings ---------- */
@@ -269,3 +269,6 @@ dialog::backdrop { background: rgba(0, 0, 0, .65); }
 .msg.narration .body em { font-style: normal; }
 .thinking { color: var(--faint); font-style: italic; animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .45; } }
+
+/* chat drawer: the divergence log */
+.d-sec .divergence { white-space: pre-wrap; max-height: 320px; overflow-y: auto; }

@@ -43,15 +43,25 @@ func TestParagraphsHardWrapKeepsUTF8(t *testing.T) {
 	}
 }
 
-func TestSplitPages(t *testing.T) {
-	group := []page{{Index: 9}, {Index: 10}}
-	text := "=== PAGE 10 ===\nA: Xin chào\n\n=== PAGE 11 ===\nB: Tạm biệt"
-	units := splitPages(text, group)
-	if len(units) != 2 || units[0].Page != 10 || units[1].Text != "B: Tạm biệt" {
-		t.Fatalf("unexpected units: %+v", units)
+func TestSplitChapters(t *testing.T) {
+	long := strings.Repeat("Lâm Phong luyện kiếm. ", 30)
+	units := []unit{
+		{Page: 1, Text: "MỤC LỤC\nChương 1\nChương 2"}, // a table of contents makes no chapter of its own
+		{Page: 2, Text: "Chương 1: Làng Thanh Vân\n" + long},
+		{Page: 3, Text: long + "\nChương 2 Hắc Sơn\n" + long},
+		{Page: 4, Text: long},
 	}
-	if u := splitPages("no markers", group); len(u) != 1 || u[0].Page != 10 {
-		t.Fatalf("fallback failed: %+v", u)
+	chs := splitChapters(units, "Huyết Long.pdf", 0)
+	if len(chs) != 2 || chs[0].title != "Chương 1: Làng Thanh Vân" || chs[1].title != "Chương 2 Hắc Sơn" {
+		t.Fatalf("chapters: %+v", chs)
+	}
+	if chs[0].pages() != "1-3" || chs[1].pages() != "3-4" || !strings.HasPrefix(chs[1].units[0].Text, "Chương 2") {
+		t.Errorf("pages %s / %s, second starts %q", chs[0].pages(), chs[1].pages(), chs[1].units[0].Text[:20])
+	}
+	// No headings: one chapter named after the file, cut in parts when long.
+	chs = splitChapters([]unit{{Page: 1, Text: long}, {Page: 2, Text: long}, {Page: 3, Text: long}}, "Tập 5.cbz", 1000)
+	if len(chs) != 3 || chs[0].title != "Tập 5 (phần 1/3)" {
+		t.Errorf("parts: %+v", chs)
 	}
 }
 
