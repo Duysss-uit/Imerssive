@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS chapters (
 	id TEXT PRIMARY KEY, kb_id TEXT, source_id TEXT, idx INTEGER, title TEXT, pages TEXT,
 	summary TEXT, cast_json TEXT DEFAULT '[]');
 CREATE INDEX IF NOT EXISTS idx_chapters_kb ON chapters(kb_id);
+CREATE TABLE IF NOT EXISTS divergence_log (chat_id TEXT, upto INTEGER, text TEXT);
+CREATE INDEX IF NOT EXISTS idx_divergence_log ON divergence_log(chat_id, upto);
 `
 
 // Columns added after the first release. SQLite has no ADD COLUMN IF NOT EXISTS,
@@ -60,6 +62,7 @@ var migrations = []string{
 	`ALTER TABLE providers ADD COLUMN context_window INTEGER DEFAULT 0`,
 	`ALTER TABLE chats ADD COLUMN divergence TEXT DEFAULT ''`,
 	`ALTER TABLE chats ADD COLUMN divergence_upto INTEGER DEFAULT 0`,
+	`ALTER TABLE chapters ADD COLUMN time_mark TEXT DEFAULT ''`,
 }
 
 func Open(path string) (*Store, error) {
@@ -321,7 +324,7 @@ func (s *Store) DeleteSource(id string) error {
 
 // Chapters lists a work's chapters in story order, numbered from 1.
 func (s *Store) Chapters(kbID string) ([]Chapter, error) {
-	rows, err := s.db.Query(`SELECT c.id,c.kb_id,c.source_id,c.idx,c.title,c.pages,c.summary,c.cast_json
+	rows, err := s.db.Query(`SELECT c.id,c.kb_id,c.source_id,c.idx,c.title,c.pages,c.summary,c.cast_json,c.time_mark
 		FROM chapters c JOIN sources s ON s.id=c.source_id WHERE c.kb_id=? ORDER BY s.seq, s.created_at, s.rowid, c.idx`, kbID)
 	if err != nil {
 		return nil, err
@@ -331,7 +334,7 @@ func (s *Store) Chapters(kbID string) ([]Chapter, error) {
 	for rows.Next() {
 		var c Chapter
 		var cast string
-		if err := rows.Scan(&c.ID, &c.KBID, &c.SourceID, &c.Idx, &c.Title, &c.Pages, &c.Summary, &cast); err != nil {
+		if err := rows.Scan(&c.ID, &c.KBID, &c.SourceID, &c.Idx, &c.Title, &c.Pages, &c.Summary, &cast, &c.When); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(cast), &c.Cast)
@@ -357,8 +360,8 @@ func (s *Store) SetChapters(sourceID string, chs []Chapter) error {
 			c.Cast = []string{}
 		}
 		cast, _ := json.Marshal(c.Cast)
-		_, err := s.db.Exec(`INSERT INTO chapters(id,kb_id,source_id,idx,title,pages,summary,cast_json) VALUES(?,?,?,?,?,?,?,?)`,
-			c.ID, c.KBID, sourceID, i, c.Title, c.Pages, c.Summary, string(cast))
+		_, err := s.db.Exec(`INSERT INTO chapters(id,kb_id,source_id,idx,title,pages,summary,cast_json,time_mark) VALUES(?,?,?,?,?,?,?,?,?)`,
+			c.ID, c.KBID, sourceID, i, c.Title, c.Pages, c.Summary, string(cast), c.When)
 		if err != nil {
 			return err
 		}
@@ -565,14 +568,92 @@ func (s *Store) SaveChat(c *Chat) error {
 }
 
 // SetDivergence stores a chat's divergence log; upTo (when > 0) is the last
-// message it now accounts for.
+// message it now accounts for. Every version is kept, so rolling the chat
+// back can bring back the log as it was at that point.
 func (s *Store) SetDivergence(id, text string, upTo int64) error {
 	if upTo > 0 {
-		_, err := s.db.Exec(`UPDATE chats SET divergence=?, divergence_upto=? WHERE id=?`, text, upTo, id)
+		if _, err := s.db.Exec(`UPDATE chats SET divergence=?, divergence_upto=? WHERE id=?`, text, upTo, id); err != nil {
+			return err
+		}
+	} else if _, err := s.db.Exec(`UPDATE chats SET divergence=? WHERE id=?`, text, id); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE chats SET divergence=? WHERE id=?`, text, id)
+	_, err := s.db.Exec(`INSERT INTO divergence_log(chat_id,upto,text) SELECT id, divergence_upto, divergence FROM chats WHERE id=?`, id)
 	return err
+}
+
+// divergenceAt is the latest version of a chat's divergence log that
+// accounts for no message after msgID.
+func (s *Store) divergenceAt(chatID string, msgID int64) (text string, upTo int64) {
+	s.db.QueryRow(`SELECT text, upto FROM divergence_log WHERE chat_id=? AND upto<=? ORDER BY upto DESC, rowid DESC LIMIT 1`,
+		chatID, msgID).Scan(&text, &upTo)
+	return text, upTo
+}
+
+// RollBack deletes a chat's messages after msgID and brings the divergence
+// log back to how it was at that point. It returns how many messages went.
+func (s *Store) RollBack(chatID string, msgID int64) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE chat_id=? AND id>?`, chatID, msgID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	text, upTo := s.divergenceAt(chatID, msgID)
+	if _, err := s.db.Exec(`DELETE FROM divergence_log WHERE chat_id=? AND upto>?`, chatID, msgID); err != nil {
+		return n, err
+	}
+	_, err = s.db.Exec(`UPDATE chats SET divergence=?, divergence_upto=? WHERE id=?`, text, upTo, chatID)
+	s.TouchChat(chatID)
+	return n, err
+}
+
+// MaxSummarizedID is the last message folded into long-term memory (0 = none).
+func (s *Store) MaxSummarizedID(chatID string) int64 {
+	var id sql.NullInt64
+	s.db.QueryRow(`SELECT MAX(id) FROM messages WHERE chat_id=? AND summarized=1`, chatID).Scan(&id)
+	return id.Int64
+}
+
+// Unsummarize returns every message to the live history (its memory notes are gone).
+func (s *Store) Unsummarize(chatID string) error {
+	_, err := s.db.Exec(`UPDATE messages SET summarized=0 WHERE chat_id=?`, chatID)
+	return err
+}
+
+// Branch copies a chat up to msgID into a new chat: its messages (all live,
+// memory is rebuilt as the branch goes on) and its divergence log as it was
+// at that point.
+func (s *Store) Branch(src Chat, msgID int64, title string) (Chat, error) {
+	c := src
+	c.ID, c.Title = "", title
+	if err := s.SaveChat(&c); err != nil {
+		return c, err
+	}
+	msgs, err := s.Messages(src.ID, false)
+	if err != nil {
+		return c, err
+	}
+	text, upTo := s.divergenceAt(src.ID, msgID)
+	var newUpTo int64
+	for _, m := range msgs {
+		if m.ID > msgID {
+			break
+		}
+		res, err := s.db.Exec(`INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)`, c.ID, m.Role, m.Content, m.CreatedAt)
+		if err != nil {
+			return c, err
+		}
+		if m.ID <= upTo {
+			newUpTo, _ = res.LastInsertId()
+		}
+	}
+	if text != "" {
+		if err := s.SetDivergence(c.ID, text, max(newUpTo, 1)); err != nil {
+			return c, err
+		}
+		c.Divergence = text
+	}
+	return c, nil
 }
 
 // SetChatProvider switches the model a conversation uses.
@@ -587,6 +668,9 @@ func (s *Store) TouchChat(id string) {
 
 func (s *Store) DeleteChat(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM messages WHERE chat_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM divergence_log WHERE chat_id=?`, id); err != nil {
 		return err
 	}
 	_, err := s.db.Exec(`DELETE FROM chats WHERE id=?`, id)

@@ -289,11 +289,11 @@ func FormatContext(hits []Hit, maxChars int) string {
 		}
 		seen[key] = true
 		label := map[string]string{
-			LevelOverview: "Tổng quan", LevelEntity: "Hồ sơ", LevelSection: "Tóm tắt",
-			LevelRaw: "Trích đoạn", LevelMemory: "Ký ức hội thoại",
+			LevelOverview: "Overview", LevelEntity: "Profile", LevelSection: "Chapter summary",
+			LevelRaw: "Passage", LevelMemory: "Memory of this conversation",
 		}[h.Str("level")]
 		if label == "" {
-			label = "Ghi chú"
+			label = "Note"
 		}
 		if name := h.Str("name"); name != "" {
 			label += ": " + name

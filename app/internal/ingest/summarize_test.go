@@ -190,10 +190,10 @@ func TestMapWholeWorkThenContinue(t *testing.T) {
 	if len(cps) != 2 {
 		t.Fatalf("map calls = %d", len(cps))
 	}
-	if !strings.Contains(cps[0], "Chương 1 · Chương 1") || !strings.Contains(cps[0], "Đây là chương đầu tiên") {
+	if !strings.Contains(cps[0], "Chapter 1 · Chương 1") || !strings.Contains(cps[0], "This is the first chapter") {
 		t.Errorf("first chapter prompt:\n%s", cps[0])
 	}
-	if !strings.Contains(between(cps[1], "<story_so_far>", "</story_so_far>"), "1. Chương 1 (tr. 1-2): Tóm tắt: Lâm Phong lê") {
+	if !strings.Contains(between(cps[1], "<story_so_far>", "</story_so_far>"), "1. Chương 1 (p. 1-2): Tóm tắt: Lâm Phong lê") {
 		t.Errorf("second chapter doesn't see the first:\n%s", cps[1])
 	}
 	if model.count("Merge these notes") != 1 {
@@ -221,11 +221,21 @@ func TestMapWholeWorkThenContinue(t *testing.T) {
 	add("Chương 3.pdf")
 	s.runKB(kb, false)
 	cps = model.chapterPrompts()
-	if len(cps) != 1 || !strings.Contains(cps[0], "Chương 3 · Chương 3") || !strings.Contains(cps[0], "2. Chương 2") {
+	if len(cps) != 1 || !strings.Contains(cps[0], "Chapter 3 · Chương 3") || !strings.Contains(cps[0], "2. Chương 2") {
 		t.Errorf("continuation prompt:\n%q", cps)
 	}
-	if model.count("Hồ sơ gộp của Lâm Phong") != 1 {
+	merges := 0
+	for _, p := range model.prompts {
+		if strings.Contains(p, "Merge these notes") && strings.Contains(p, "Hồ sơ gộp của Lâm Phong") {
+			merges++
+		}
+	}
+	if merges != 1 {
 		t.Error("existing profile not merged with the new notes")
+	}
+	// The chapter is read knowing who was met before.
+	if known := between(cps[0], "<known_characters>", "</known_characters>"); !strings.Contains(known, "- Lâm Phong: Hồ sơ gộp của Lâm Phong") {
+		t.Errorf("known characters in the continuation: %q", known)
 	}
 	if chs, _ := st.Chapters(kb); len(chs) != 3 || vec.count(rag.LevelEntity) != 1 || vec.count(rag.LevelSection) != 3 {
 		t.Errorf("stored: %d chapters, %d entities, %d chapter docs", len(chs), vec.count(rag.LevelEntity), vec.count(rag.LevelSection))

@@ -51,6 +51,7 @@ var defaultSettings = map[string]string{
 	"chat.attach_images":     "false",
 	"chat.image_k":           "2",
 	"chat.divergence_every":  "3",
+	"chat.auto_profiles":     "true",
 	"worker.idle_minutes":    "5",
 	"worker.python":          "",               // empty = auto-detect worker/.venv
 	"log.model":              applog.ModelFull, // full | response | off
@@ -180,6 +181,7 @@ func (a *App) chatOptions() chat.Options {
 		ImageK:       a.intSetting("chat.image_k"),
 
 		DivergenceEvery: a.intSetting("chat.divergence_every"),
+		AutoProfiles:    a.setting("chat.auto_profiles") == "true",
 	}
 }
 
@@ -425,7 +427,7 @@ func (a *App) TestProvider(id string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	return llm.Complete(ctx, prov, llm.Request{Purpose: "thử provider", MaxTokens: 2000,
-		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, "Chào bằng một câu ngắn tiếng Việt.")}})
+		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, "Say hello in one short sentence.")}})
 }
 
 // ---- knowledge bases ----
@@ -676,6 +678,22 @@ func (a *App) GetMessages(chatID string) ([]store.Message, error) {
 func (a *App) SendMessage(chatID, text string) (store.Message, error) {
 	m, err := a.chat.Send(chatID, text)
 	return m, act(err, "chat: %s người chơi gửi %d ký tự", chatID, len([]rune(text)))
+}
+
+// ContinueChat has the model carry the story on without a player message.
+func (a *App) ContinueChat(chatID string) error {
+	return act(a.chat.Continue(chatID), "chat: %s tiếp tục (không nhập gì)", chatID)
+}
+
+// RollBackChat deletes the messages after msgID so the chat goes on from there.
+func (a *App) RollBackChat(chatID string, msgID int64) error {
+	return act(a.chat.RollBack(context.Background(), chatID, msgID), "chat: %s quay lại tin nhắn %d", chatID, msgID)
+}
+
+// BranchChat starts a new chat from this one as it was at msgID.
+func (a *App) BranchChat(chatID string, msgID int64) (store.Chat, error) {
+	c, err := a.chat.Branch(chatID, msgID)
+	return c, act(err, "chat: %s rẽ nhánh tại tin nhắn %d → %s", chatID, msgID, c.ID)
 }
 
 func (a *App) Regenerate(chatID string) error {

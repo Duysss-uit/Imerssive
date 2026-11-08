@@ -1,0 +1,2 @@
+<!-- Sent as the player's turn when they press send with nothing typed (not saved in the history). {{char}} and {{user}} become the character's (or narrator's) and the player's names. -->
+({{user}} says and does nothing this turn: the player lets the story move on. Continue from exactly where the last reply ended: the other characters act and talk, the scene develops, or time moves forward a little. Don't repeat or sum up what was already said, and don't write anything {{user}} says, does or thinks. End at a new moment that invites {{user}} to act.)

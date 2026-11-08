@@ -4,7 +4,7 @@ Placeholders: {page} page number, {title} name of the work. -->
 This image is page {page} of the comic/manga "{title}". Transcribe it for someone who cannot see it, following the panels in reading order (manga: right to left, top to bottom).
 
 Use exactly this layout, in the language of the dialogue, and nothing else:
-Characters: who appears (their name if the page shows or says it, otherwise a short description that stays recognizable, like "the blond boy in a school uniform")
+Characters: who appears, separated by ";". Use their name when the page shows or says it. Otherwise write a label in exactly this form, built only from what doesn't change from page to page: [?] gender · hair · most distinctive feature (glasses, scar, eye color, build...) — for example "[?] girl · long black hair · glasses". Don't put clothes, pose, expression or mood in a label.
 Setting: place, time and mood, in one line
 Panels:
 1. what happens: actions, expressions, important objects
@@ -13,4 +13,4 @@ Panels:
    SFX: sound effects
 2. ...
 
-Copy every line of dialogue and narration word for word. Write only what the page shows; don't guess what happens elsewhere in the story. For a page with no story (cover, credits, ads), write "Panels: none" and what the page is.
+For Speaker, write the name or exactly the same label as on the Characters line. Copy every line of dialogue and narration word for word. Write only what the page shows; don't guess what happens elsewhere in the story. For a page with no story (cover, credits, ads), write "Panels: none" and what the page is.

@@ -42,11 +42,11 @@ func (s *Service) brief(ctx context.Context, kbIDs []string, maxChars int) strin
 		for _, e := range ents[:min(len(ents), briefNames)] {
 			list = append(list, fmt.Sprintf("%s (%s)", e.Name, e.Type))
 		}
-		names = "[Có hồ sơ trong truyện]\n" + strings.Join(list, ", ")
+		names = "[Profiles in the work]\n" + strings.Join(list, ", ")
 	}
 	m := s.lore.Map(kbIDs, max(maxChars-len([]rune(names)), maxChars/2))
 	if m != "" {
-		m = "[Bản đồ truyện]\n" + m
+		m = "[Story map]\n" + m
 	}
 	return strings.TrimSpace(m + "\n\n" + names)
 }
@@ -84,7 +84,7 @@ func (s *Service) research(ctx context.Context, kbIDs []string, providerID, purp
 		}
 		msgs = append(msgs, reply)
 		for _, c := range turn.Calls {
-			result := "Đã hết lượt tra cứu. Hãy viết kết quả từ những gì đã có."
+			result := "No lookups left. Write the result from what you have."
 			if searches < maxSearches {
 				searches++
 				result = s.lore.Run(ctx, kbIDs, c, resultChars)
@@ -140,7 +140,7 @@ func (s *Service) GenerateCharacter(ctx context.Context, kbIDs []string, name, h
 	if ents, err := s.Entities(ctx, kbIDs); err == nil {
 		for _, e := range ents {
 			if strings.EqualFold(strings.TrimSpace(e.Name), strings.TrimSpace(name)) {
-				extra += fmt.Sprintf("[Hồ sơ: %s]\n%s\n", e.Name, e.Profile)
+				extra += fmt.Sprintf("[Profile: %s]\n%s\n", e.Name, e.Profile)
 			}
 		}
 	}

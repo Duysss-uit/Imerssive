@@ -15,12 +15,12 @@ func TestBuildSceneSystem(t *testing.T) {
 	cards := []store.Character{{Name: "mai linh", SpeakingStyle: "Nói nhỏ nhẹ."}}
 	chat := store.Chat{Mode: store.ModeScene, PersonaName: "Lâm Phong", PersonaDesc: "Kiếm sĩ trẻ."}
 
-	got := buildSceneSystem(scen, chat, cards)
+	got := buildSceneSystem(scen, chat, cards, map[string][]string{"mai linh": {"Huynh đừng đi!"}})
 	cast := got[strings.Index(got, "<cast>"):strings.Index(got, "</cast>")]
 	if strings.Contains(cast, "Lâm Phong") {
 		t.Error("the player's own role must not be in the narrator's cast")
 	}
-	if !strings.Contains(cast, "Mai Linh") || !strings.Contains(cast, "Nói nhỏ nhẹ.") {
+	if !strings.Contains(cast, "Mai Linh") || !strings.Contains(cast, "Nói nhỏ nhẹ.") || !strings.Contains(cast, `"Huynh đừng đi!"`) {
 		t.Errorf("cast should include Mai Linh with her card's speaking style:\n%s", cast)
 	}
 	if !strings.Contains(got, `<player_character name="Lâm Phong">`) || strings.Contains(got, "{{user}}") {

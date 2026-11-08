@@ -101,7 +101,7 @@ func splitLong(c chapter, maxChars int) []chapter {
 		parts = append(parts, cur)
 	}
 	for i := range parts {
-		parts[i].title = fmt.Sprintf("%s (phần %d/%d)", c.title, i+1, len(parts))
+		parts[i].title = fmt.Sprintf("%s (part %d/%d)", c.title, i+1, len(parts))
 	}
 	return parts
 }

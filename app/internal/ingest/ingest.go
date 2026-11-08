@@ -372,12 +372,9 @@ func loadUnits(path string) ([]unit, error) {
 }
 
 type sectionResult struct {
-	Summary  string `json:"summary"`
-	Entities []struct {
-		Name        string `json:"name"`
-		Type        string `json:"type"`
-		Description string `json:"description"`
-	} `json:"entities"`
+	Summary  string      `json:"summary"`
+	When     string      `json:"when"` // when the chapter happens, so far
+	Entities []rawEntity `json:"entities"`
 }
 
 // describePages has the vision model transcribe comic pages, one page per
@@ -434,29 +431,29 @@ func (s *Service) describePages(ctx context.Context, id, providerID, title strin
 type entity struct {
 	Name, Type string
 	notes      []string
+	quotes     []string // lines they say, in story order
+	aliases    []string // other names and labels the story used for them
 	profile    string
 }
 
-func mergeEntities(results []sectionResult) []*entity {
-	byKey := map[string]*entity{}
-	var order []*entity
-	for _, r := range results {
-		for _, e := range r.Entities {
-			name := strings.TrimSpace(e.Name)
-			if name == "" || strings.TrimSpace(e.Description) == "" {
-				continue
-			}
-			key := strings.ToLower(name)
-			ent := byKey[key]
-			if ent == nil {
-				ent = &entity{Name: name, Type: e.Type}
-				byKey[key] = ent
-				order = append(order, ent)
-			}
-			ent.notes = append(ent.notes, strings.TrimSpace(e.Description))
+// maxQuotes is how many lines are kept with a profile.
+const maxQuotes = 8
+
+// addQuotes keeps new distinct lines, spread over the story once there are too many.
+func (e *entity) addQuotes(qs []string) {
+	for _, q := range qs {
+		q = strings.Trim(strings.TrimSpace(q), `"“”「」`)
+		if q != "" && !slices.Contains(e.quotes, q) {
+			e.quotes = append(e.quotes, q)
 		}
 	}
-	return order
+	if len(e.quotes) > maxQuotes {
+		kept := make([]string, 0, maxQuotes)
+		for i := 0; i < maxQuotes; i++ {
+			kept = append(kept, e.quotes[i*len(e.quotes)/maxQuotes])
+		}
+		e.quotes = kept
+	}
 }
 
 func totalLen(ss []string) int {

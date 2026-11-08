@@ -56,6 +56,8 @@ PDF/EPUB/CBZ ─► trích xuất từng trang
                      {kb_id, source_id, level: raw|section|entity, pages, name}
 ```
 
+**Một nhân vật, một hồ sơ:** vision đọc từng trang riêng nên người chưa có tên được gắn nhãn theo ngoại hình cố định (`[?] nữ · tóc đen dài · kính`). Khi lập bản đồ, model nhận danh sách nhân vật đã gặp kèm ngoại hình và trả về `aliases` cho những nhãn nó nhận ra là cùng một người; app gộp chúng vào một hồ sơ, lấy tên thật khi truyện tiết lộ, và dùng bảng bí danh này cho câu thoại, tra cứu và chèn hồ sơ.
+
 Không lần gọi model nào phải ôm cả một chương hay cả bộ truyện: mỗi provider có **context window** (app tự hỏi LM Studio/OpenRouter, hoặc bạn nhập trong Cài đặt → Provider), và mọi prompt (đoạn chương, ghi chú gộp hồ sơ, lịch sử chat, kết quả tra cứu) được cắt cho vừa con số đó, chừa chỗ cho phần suy nghĩ và câu trả lời.
 
 Mỗi bước chỉ bắt đầu khi mọi tài liệu đang chờ của bộ truyện đã xong bước trước. Thứ tự truyện là thứ tự thêm vào; nhiều file chọn cùng lúc được xếp theo tên tự nhiên (Chương 2 trước Chương 10). Tài liệu thêm sau **nối tiếp bản đồ**: các chương mới được đọc với bản đồ các chương trước làm ngữ cảnh, hồ sơ cũ được cập nhật. Xử lý lại một tài liệu nằm giữa truyện, hoặc bấm “↻ Lập lại bản đồ”, sẽ lập lại cả bộ từ đầu. Bộ truyện nạp bằng bản cũ (có “tổng quan” thay vì bản đồ) cần bấm nút này một lần.
@@ -66,7 +68,9 @@ Mỗi bước chỉ bắt đầu khi mọi tài liệu đang chờ của bộ tr
 2. Model có ba công cụ: `get_character` (hồ sơ), `search_story` (tìm theo nghĩa và từ khoá) và `read_chapter` (đọc nguyên văn/lời thoại của một chương, theo trang). Nó tự tra tối đa 4 lần trước khi trả lời; UI hiện “Đang tra cứu…”. Tìm kiếm chạy bằng **LangChain** trong worker: vector Chroma + BM25 (bắt chính xác tên riêng), ghép bằng `EnsembleRetriever`.
 3. Model không gọi được công cụ thì app tự tìm như trước: kết quả đặt trong thẻ `<memory>` ở lượt user mới nhất (không nằm trong system prompt, không lưu vào lịch sử).
 4. **Sổ thay đổi:** cứ `chat.divergence_every` lượt (mặc định 3), model tóm tắt ghi lại những gì câu chuyện đã khác nguyên tác vì lựa chọn của người chơi (ai chết, quan hệ đổi, đang ở đâu…). Sổ này đứng trên nguyên tác: model tra nguyên tác rồi điều chỉnh theo sổ. Xem, sửa hoặc cập nhật ngay ở nút ⋯ trong màn hình chat.
-5. Khi số tin nhắn vượt `chat.window`, nửa cũ nhất được tóm tắt thành ghi chú ký ức, embed vào RAG (`level=memory`) rồi rời khỏi context.
+5. **Gửi khi ô chat trống:** model tự viết tiếp câu chuyện (các nhân vật khác hành động, cảnh tiến triển), không lưu tin nhắn trống nào.
+6. **Quay lại / rẽ nhánh:** ở mỗi tin nhắn, “↩ Quay lại đây” xoá các tin sau nó để chat tiếp từ đó (sổ thay đổi trở về như lúc ấy, ký ức dài hạn viết từ các tin đã xoá cũng bị bỏ); “⑂ Rẽ nhánh” mở một cuộc trò chuyện mới tiếp nối từ tin đó, cuộc cũ giữ nguyên.
+7. Khi số tin nhắn vượt `chat.window`, nửa cũ nhất được tóm tắt thành ghi chú ký ức, embed vào RAG (`level=memory`) rồi rời khỏi context.
 
 ## Cài đặt
 

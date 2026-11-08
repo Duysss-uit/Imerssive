@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -98,7 +99,7 @@ func TestChatLooksUpAndKeepsDivergence(t *testing.T) {
 	e := New(st, vec, &lore.Lore{St: st, Vec: vec, Spaces: spaces, PagesDir: dir}, spaces,
 		func(string, string) (llm.Provider, error) { return model, nil },
 		func() Options {
-			return Options{RAGK: 4, ContextChars: 4000, Window: 40, MaxTokens: 2000, DivergenceEvery: 1}
+			return Options{RAGK: 4, ContextChars: 4000, Window: 40, MaxTokens: 2000, DivergenceEvery: 1, AutoProfiles: true}
 		},
 		func(ev string, _ any) { evMu.Lock(); events = append(events, ev); evMu.Unlock() })
 
@@ -108,20 +109,36 @@ func TestChatLooksUpAndKeepsDivergence(t *testing.T) {
 	if err := e.Create(&c); err != nil {
 		t.Fatal(err)
 	}
-	st.AddMessage(c.ID, "user", "*phá cửa ngục*")
+	st.AddMessage(c.ID, "user", "*phá cửa ngục tìm Mai Linh*")
 	reply, err := e.generate(context.Background(), c.ID)
 	if err != nil || !strings.Contains(reply, "Huynh đến rồi") {
 		t.Fatalf("reply=%q err=%v", reply, err)
 	}
 	first := model.reqs[0]
-	if !strings.Contains(first.System, "<story_map>") || !strings.Contains(first.System, "1. Chương 1 (tr. 1-9): Mai Linh bị bắt") {
+	if !strings.Contains(first.System, "<story_map>") || !strings.Contains(first.System, "1. Chương 1 (p. 1-9): Mai Linh bị bắt") {
 		t.Errorf("story map not in the system prompt:\n%s", first.System)
+	}
+	lastParts := first.Messages[len(first.Messages)-1].Parts
+	if r := lastParts[len(lastParts)-1].Text; !strings.Contains(r, "reply in the language of Lâm Phong's message") {
+		t.Errorf("per-turn reminder missing or unfilled: %q", r)
 	}
 	if len(first.Tools) != len(lore.Tools) {
 		t.Errorf("tools offered: %d", len(first.Tools))
 	}
-	if strings.Contains(first.Messages[len(first.Messages)-1].Parts[0].Text, "Thanh mai") {
-		t.Error("with tools, the source should be looked up, not pasted in")
+	var present, memory string
+	for _, p := range lastParts {
+		if strings.HasPrefix(p.Text, "<characters_present>") {
+			present = p.Text
+		}
+		if strings.HasPrefix(p.Text, "<memory>") {
+			memory = p.Text
+		}
+	}
+	if !strings.Contains(present, "Mai Linh (character): Thanh mai trúc mã") {
+		t.Errorf("profile of the character just named not added: %q", present)
+	}
+	if strings.Contains(memory, "Thanh mai") {
+		t.Error("with tools, source passages should be looked up, not retrieved into memory")
 	}
 	second := model.reqs[1].Messages
 	if res := second[len(second)-1]; res.Role != llm.RoleTool || !strings.Contains(res.Parts[0].Text, "Thanh mai trúc mã") {
@@ -154,6 +171,20 @@ func TestChatLooksUpAndKeepsDivergence(t *testing.T) {
 	}
 	if got, _ := st.Chat(c.ID); got.DivergenceUpTo == 0 {
 		t.Error("editing the log lost its position")
+	}
+
+	// Sending nothing: the history ends with a reply, so the model is asked to
+	// carry the story on, and nothing is saved for the player.
+	st.AddMessage(c.ID, "assistant", "[Mai Linh]\n\"Đi thôi!\"")
+	before, _ := st.Messages(c.ID, false)
+	start := len(model.reqs)
+	e.generate(context.Background(), c.ID)
+	last := model.reqs[start].Messages // the first call of the turn, before any lookup
+	if p := last[len(last)-1]; p.Role != llm.RoleUser || !slices.ContainsFunc(p.Parts, func(x llm.Part) bool { return strings.Contains(x.Text, "Lâm Phong says and does nothing this turn") }) {
+		t.Errorf("continue turn: %+v", p)
+	}
+	if after, _ := st.Messages(c.ID, false); len(after) != len(before) {
+		t.Error("continuing saved a player message")
 	}
 }
 

@@ -116,6 +116,7 @@ type Chapter struct {
 	Pages    string   `json:"pages"`
 	Summary  string   `json:"summary"`
 	Cast     []string `json:"cast"`
+	When     string   `json:"when"` // when it happens in the story ("day 3, night", "a year later"), if the text says
 }
 
 type Message struct {

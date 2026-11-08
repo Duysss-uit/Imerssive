@@ -60,7 +60,7 @@ func TestSplitChapters(t *testing.T) {
 	}
 	// No headings: one chapter named after the file, cut in parts when long.
 	chs = splitChapters([]unit{{Page: 1, Text: long}, {Page: 2, Text: long}, {Page: 3, Text: long}}, "Tập 5.cbz", 1000)
-	if len(chs) != 3 || chs[0].title != "Tập 5 (phần 1/3)" {
+	if len(chs) != 3 || chs[0].title != "Tập 5 (part 1/3)" {
 		t.Errorf("parts: %+v", chs)
 	}
 }

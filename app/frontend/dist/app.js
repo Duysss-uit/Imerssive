@@ -817,7 +817,8 @@ async function openChat(id) {
     ? ["Bạn vào vai " + chat.personaName]
     : [scen?.title]).concat(kbIds?.length ? kbIds.map(kbName).join(", ") : []).filter(Boolean).join(" · ");
   $("#chat-model").innerHTML = providerOptions(chat?.providerId, "chat");
-  $("#input").placeholder = sub.scene ? `${chat.personaName} làm gì, nói gì… (*hành động* trong dấu sao)` : `Nhắn tin với ${sub.name}…`;
+  $("#input").placeholder = (sub.scene ? `${chat.personaName} làm gì, nói gì… (*hành động* trong dấu sao)` : `Nhắn tin với ${sub.name}…`)
+    + " — để trống rồi gửi để truyện tự tiếp diễn";
   $("#chat-error").hidden = true;
   await renderMessages();
   setStreaming(state.streaming[id] != null);
@@ -939,6 +940,8 @@ function introEl() {
 // "[Name]"); splitScene turns a reply into {speaker, text} blocks, speaker ""
 // meaning narration. Untagged text (e.g. the scenario opening) is narration.
 const NARRATOR_TAG = /^(narrator|narration|người dẫn truyện|dẫn truyện|người kể chuyện)$/i;
+const TIMELINE_TAG = /^(timeline|time|mốc thời gian|thời gian|dòng thời gian)$/i;
+const TIMELINE = "\u0000timeline"; // speaker of a [Timeline] block
 function splitScene(text, streaming = false) {
   const lines = text.split("\n");
   if (streaming && /^\s*\[[^\]\n]*$/.test(lines.at(-1))) lines.pop(); // half-written tag
@@ -956,7 +959,7 @@ function splitScene(text, streaming = false) {
     if (m) {
       flush();
       const name = m[1].trim();
-      cur = { speaker: NARRATOR_TAG.test(name) ? "" : name, text: m[2] };
+      cur = { speaker: NARRATOR_TAG.test(name) ? "" : TIMELINE_TAG.test(name) ? TIMELINE : name, text: m[2] };
     } else cur.text += "\n" + line;
   }
   flush();
@@ -976,7 +979,8 @@ function speakerAvatar(name) {
   return el;
 }
 
-// sceneTurnEl renders one narrator reply as a run of bubbles, one per block.
+// sceneTurnEl renders one narrator reply: narration as plain italic prose
+// (no bubble), each character's lines as their own bubble.
 function sceneTurnEl(text, { streaming = false, extra = "" } = {}) {
   const turn = document.createElement("div");
   turn.className = "scene-turn" + (streaming ? " streaming" : "");
@@ -986,25 +990,40 @@ function sceneTurnEl(text, { streaming = false, extra = "" } = {}) {
 function fillSceneTurn(turn, text, streaming, extra = "") {
   turn.innerHTML = "";
   const blocks = splitScene(text, streaming);
+  // While streaming the turn is redrawn on every chunk: only blocks that
+  // weren't there before fade in.
+  const shown = Number(turn.dataset.shown || 0);
   blocks.forEach((b, i) => {
     const el = document.createElement("div");
-    el.className = "msg assistant" + (b.speaker ? "" : " narration");
-    el.append(speakerAvatar(b.speaker));
     const last = i === blocks.length - 1;
-    el.insertAdjacentHTML("beforeend", `<div class="col"><div class="who">${esc(b.speaker || "Người dẫn truyện")}</div>
-      <div class="body${streaming && last ? " typing" : ""}">${formatMsg(b.text)}</div>${last ? extra : ""}</div>`);
+    const body = `<div class="body${streaming && last ? " typing" : ""}">${formatMsg(b.text)}</div>`;
+    if (b.speaker === TIMELINE) {
+      el.className = "timeline-mark";
+      el.innerHTML = `<span>⏱ ${esc(b.text.replace(/\s*\n\s*/g, " · "))}</span>${last ? extra : ""}`;
+    } else if (b.speaker) {
+      el.className = "msg assistant";
+      el.append(speakerAvatar(b.speaker));
+      el.insertAdjacentHTML("beforeend", `<div class="col"><div class="who">${esc(b.speaker)}</div>${body}${last ? extra : ""}</div>`);
+    } else {
+      el.className = "narr";
+      el.innerHTML = `<span class="narr-icon" aria-hidden="true">≡</span><div class="col">${body}${last ? extra : ""}</div>`;
+    }
+    if (streaming && i >= shown) el.classList.add("rise");
     turn.append(el);
   });
+  if (streaming) turn.dataset.shown = blocks.length;
 }
 
 function msgEl(m, canRegen = false) {
   const chat = state.chatId;
   const isUser = m.role === "user";
-  const tools = `<div class="tools ${canRegen ? "always" : ""}">${canRegen ? `<button data-a="regen" title="Tạo lại">↻ Tạo lại</button>` : ""}<button data-a="edit">Sửa</button><button data-a="del">Xoá</button></div>`;
+  const tools = `<div class="tools ${canRegen ? "always" : ""}">${canRegen ? `<button data-a="regen" title="Tạo lại">↻ Tạo lại</button>` : ""}<button data-a="edit">Sửa</button><button data-a="del">Xoá</button>`
+    + `<button data-a="rollback" title="Xoá mọi tin nhắn sau tin này và chat tiếp từ đây">↩ Quay lại đây</button>`
+    + `<button data-a="branch" title="Mở một cuộc trò chuyện mới tiếp nối từ tin này, giữ nguyên cuộc hiện tại">⑂ Rẽ nhánh</button></div>`;
   let el;
   if (!isUser && state.chat?.mode === "scene") {
     el = sceneTurnEl(m.content, { extra: tools });
-    if (m.summarized) el.querySelector(".who").insertAdjacentHTML("beforeend", `<span class="badge">đã vào ký ức</span>`);
+    if (m.summarized) (el.querySelector(".who") || el.querySelector(".body"))?.insertAdjacentHTML("beforeend", `<span class="badge">đã vào ký ức</span>`);
   } else {
     el = document.createElement("div");
     el.className = "msg " + m.role;
@@ -1016,6 +1035,8 @@ function msgEl(m, canRegen = false) {
   el.querySelector(".tools").onclick = async e => {
     const a = e.target.dataset.a;
     if (a === "regen") regenerate();
+    if (a === "rollback") rollbackDialog(chat, m.id);
+    if (a === "branch") branchFrom(chat, m.id);
     if (a === "del") { await guard(() => api.DeleteMessage(m.id)); el.remove(); }
     if (a === "edit") {
       openModal(`<h2>Sửa tin nhắn</h2><textarea name="c" rows="8">${esc(m.content)}</textarea>
@@ -1024,6 +1045,28 @@ function msgEl(m, canRegen = false) {
     }
   };
   return el;
+}
+
+// rollbackDialog returns the chat to message msgId, or branches from it instead.
+function rollbackDialog(chatId, msgId) {
+  if (state.streaming[chatId] != null) return toast("Đợi trả lời xong (hoặc bấm dừng) rồi hãy quay lại", true);
+  openModal(`<h2>Quay lại tin nhắn này?</h2>
+    <p class="muted">Mọi tin nhắn sau tin này sẽ bị xoá và câu chuyện tiếp tục từ đây. Sổ thay đổi trở về như lúc đó.</p>
+    <p class="muted small">Muốn giữ lại diễn biến hiện tại thì chọn “Rẽ nhánh”: một cuộc trò chuyện mới bắt đầu từ tin này, cuộc cũ giữ nguyên.</p>
+    <div class="modal-actions"><button value="cancel">Huỷ</button><button value="branch">⑂ Rẽ nhánh</button><button value="rollback" class="primary">↩ Quay lại</button></div>`,
+    async (_, action) => {
+      if (action === "branch") return branchFrom(chatId, msgId);
+      await api.RollBackChat(chatId, msgId);
+      if (state.chatId === chatId) { await openChat(chatId); toast("Đã quay lại — chat tiếp từ đây"); }
+    });
+}
+
+async function branchFrom(chatId, msgId) {
+  if (state.streaming[chatId] != null) return toast("Đợi trả lời xong (hoặc bấm dừng) rồi hãy rẽ nhánh", true);
+  const c = await guard(() => api.BranchChat(chatId, msgId));
+  if (!c) return;
+  await openChat(c.id);
+  toast("Đã rẽ nhánh — cuộc trò chuyện cũ vẫn giữ nguyên trong lịch sử");
 }
 
 function streamEl(text) {
@@ -1102,7 +1145,14 @@ $("#composer").onsubmit = async e => {
   e.preventDefault();
   const input = $("#input");
   const text = input.value.trim();
-  if (!text || state.streaming[state.chatId] != null) return;
+  if (state.streaming[state.chatId] != null) return;
+  if (!text) {
+    // Nothing typed: the story carries on by itself.
+    $("#chat-error").hidden = true;
+    $$(".tools.always").forEach(t => { t.classList.remove("always"); t.querySelector("[data-a=regen]")?.remove(); });
+    await guard(() => api.ContinueChat(state.chatId));
+    return;
+  }
   input.value = "";
   autoGrow();
   $("#chat-error").hidden = true;

@@ -89,7 +89,7 @@ func TestResearchWithTools(t *testing.T) {
 		t.Errorf("searches = %q", look.queries)
 	}
 	first := m.reqs[0].Messages[0].Parts[0].Text
-	for _, want := range []string{"1. Chương 1 (tr. 1-5): Lâm Phong đi cứu Mai Linh", "Hắc Sơn (place)", "[Hồ sơ: Lâm Phong]", "search_story"} {
+	for _, want := range []string{"1. Chương 1 (p. 1-5): Lâm Phong đi cứu Mai Linh", "Hắc Sơn (place)", "[Profile: Lâm Phong]", "search_story"} {
 		if !strings.Contains(first, want) {
 			t.Errorf("brief missing %q:\n%s", want, first)
 		}

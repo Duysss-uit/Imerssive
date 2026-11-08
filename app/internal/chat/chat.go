@@ -35,6 +35,9 @@ type Options struct {
 	// DivergenceEvery is how many replies pass between updates of the
 	// divergence log (0 = never).
 	DivergenceEvery int
+	// AutoProfiles adds the profiles of characters named in the last few
+	// messages to the turn, within a share of the model's context.
+	AutoProfiles bool
 }
 
 // vectors is the part of the vector store chat uses (rag.Store; swapped in tests).
@@ -67,7 +70,7 @@ func New(st *store.Store, r vectors, lr *lore.Lore, spaces rag.Spaces, resolve l
 func MemoryKB(chatID string) string { return "chat:" + chatID }
 
 // Narrator is the display name of the model's side in scene mode.
-const Narrator = "Người dẫn truyện"
+const Narrator = "Narrator"
 
 // Create starts a conversation and posts the opening/greeting message.
 func (e *Engine) Create(c *store.Chat) error {
@@ -156,6 +159,53 @@ func (e *Engine) Send(chatID, text string) (store.Message, error) {
 	return m, nil
 }
 
+// Continue has the model carry the story on without a message from the
+// player (sending an empty message).
+func (e *Engine) Continue(chatID string) error {
+	if e.Busy(chatID) {
+		return fmt.Errorf("nhân vật đang trả lời")
+	}
+	go e.respond(chatID)
+	return nil
+}
+
+// RollBack returns the conversation to message msgID: later messages are
+// deleted, the divergence log goes back to how it was then, and long-term
+// memory written from the deleted messages is dropped (the live history is
+// folded again as the chat goes on).
+func (e *Engine) RollBack(ctx context.Context, chatID string, msgID int64) error {
+	if e.Busy(chatID) {
+		return fmt.Errorf("nhân vật đang trả lời — dừng lại trước đã")
+	}
+	if e.st.MaxSummarizedID(chatID) > msgID {
+		if err := e.forgetMemory(ctx, chatID); err != nil {
+			return err
+		}
+	}
+	_, err := e.st.RollBack(chatID, msgID)
+	return err
+}
+
+// Branch starts a new conversation from this one as it was at message msgID;
+// the original stays as it is.
+func (e *Engine) Branch(chatID string, msgID int64) (store.Chat, error) {
+	c, err := e.st.Chat(chatID)
+	if err != nil {
+		return c, err
+	}
+	title := strings.TrimSuffix(c.Title, " · nhánh") + " · nhánh"
+	return e.st.Branch(c, msgID, title)
+}
+
+// forgetMemory deletes a chat's long-term memory and puts its messages back
+// in the live history.
+func (e *Engine) forgetMemory(ctx context.Context, chatID string) error {
+	if err := e.rag.Delete(ctx, rag.Filter{KBIDs: []string{MemoryKB(chatID)}}); err != nil {
+		return err
+	}
+	return e.st.Unsummarize(chatID)
+}
+
 // Regenerate drops the last reply and generates a new one.
 func (e *Engine) Regenerate(chatID string) error {
 	if e.Busy(chatID) {
@@ -235,9 +285,9 @@ const maxLookups = 4
 type setup struct {
 	chat    store.Chat
 	scen    *store.Scenario
-	system  string   // rules, cards, scenario (byte-stable for caching)
-	kbIDs   []string // the works the story draws from
-	other   string   // who the model plays: the character, or the narrator
+	card    *store.Character // the character, in one-on-one mode
+	kbIDs   []string         // the works the story draws from
+	other   string           // who the model plays: the character, or the narrator
 	history []store.Message
 }
 
@@ -257,8 +307,6 @@ func (e *Engine) setup(chatID string) (setup, error) {
 		if s.scen == nil {
 			return s, fmt.Errorf("bối cảnh của scene này đã bị xoá")
 		}
-		cards, _ := e.st.Characters()
-		s.system = buildSceneSystem(*s.scen, c, cards)
 		s.kbIDs = union(s.scen.KBIDs, nil)
 		s.other = Narrator
 	} else {
@@ -266,7 +314,7 @@ func (e *Engine) setup(chatID string) (setup, error) {
 		if err != nil {
 			return s, err
 		}
-		s.system = buildSystem(char, s.scen, c)
+		s.card = &char
 		s.kbIDs = char.KBIDs
 		if s.scen != nil {
 			s.kbIDs = union(s.kbIDs, s.scen.KBIDs)
@@ -275,6 +323,66 @@ func (e *Engine) setup(chatID string) (setup, error) {
 	}
 	s.history, err = e.st.Messages(chatID, true)
 	return s, err
+}
+
+// system is the system prompt: rules, the card or the scenario and cast,
+// with up to quoteChars of lines the characters really say in the source.
+func (e *Engine) system(ctx context.Context, s setup, quoteChars int) string {
+	var names []string
+	if s.card != nil {
+		names = []string{s.card.Name}
+	} else {
+		player := strings.ToLower(strings.TrimSpace(s.chat.PersonaName))
+		for _, m := range s.scen.Cast {
+			if strings.ToLower(strings.TrimSpace(m.Name)) != player {
+				names = append(names, m.Name)
+			}
+		}
+	}
+	var quotes map[string][]string
+	if n := min(quoteChars/(max(len(names), 1)*120), 3); n > 0 && len(s.kbIDs) > 0 {
+		quotes = e.lore.Quotes(ctx, s.kbIDs, names, n, 160)
+	}
+	if s.card != nil {
+		return buildSystem(*s.card, s.scen, s.chat, quotes)
+	}
+	cards, _ := e.st.Characters()
+	return buildSceneSystem(*s.scen, s.chat, cards, quotes)
+}
+
+// presentProfiles returns, in at most maxChars, the profiles of the
+// characters (and places...) named in the last few messages and not already
+// described in the system prompt, most recently named first. A character
+// stays for the few turns its name stays in that window.
+func (e *Engine) presentProfiles(ctx context.Context, s setup, maxChars int) string {
+	if maxChars < 400 || len(s.kbIDs) == 0 {
+		return ""
+	}
+	skip := map[string]bool{strings.ToLower(strings.TrimSpace(s.chat.PersonaName)): true, strings.ToLower(strings.TrimSpace(s.other)): true}
+	var recent strings.Builder
+	if s.scen != nil {
+		for _, m := range s.scen.Cast {
+			skip[strings.ToLower(strings.TrimSpace(m.Name))] = true
+		}
+		recent.WriteString(s.scen.Setting + "\n")
+	}
+	for _, m := range s.history[max(len(s.history)-6, 0):] {
+		recent.WriteString(m.Content + "\n")
+	}
+	found := lore.Mentioned(e.lore.CachedEntities(ctx, s.kbIDs), recent.String(), skip)
+	if len(found) == 0 {
+		return ""
+	}
+	each := min(max(maxChars/len(found), 250), 700)
+	var sb strings.Builder
+	for _, ent := range found {
+		line := fmt.Sprintf("%s (%s): %s", ent.Name, ent.Type, shorten(ent.Profile, each))
+		if sb.Len() > 0 && len([]rune(sb.String()))+len([]rune(line)) > maxChars {
+			break
+		}
+		sb.WriteString(line + "\n")
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 // loreBlock tells the model how to use the source: the rules, the story map
@@ -303,7 +411,19 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 		return "", err
 	}
 	maxOut, inChars := llm.Budget(provider, opts.MaxTokens)
-	system := s.system + e.loreBlock(s, inChars/5)
+	system := e.system(ctx, s, inChars/10) + e.loreBlock(s, inChars/5)
+	var blocks []string // added to the newest user turn, not saved
+	if opts.AutoProfiles {
+		if p := e.presentProfiles(ctx, s, inChars/8); p != "" {
+			blocks = append(blocks, "<characters_present>\n"+p+"\n</characters_present>")
+		}
+	}
+	withMemory := func(memory string) []string {
+		if memory == "" {
+			return blocks
+		}
+		return append(slices.Clone(blocks), "<memory>\n"+memory+"\n</memory>")
+	}
 
 	// Retrieval query: the latest exchange carries the most signal. Before
 	// anything has been said, look up where the story starts and who the player is.
@@ -328,7 +448,7 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 	if tu, ok := provider.(llm.ToolUser); ok && len(s.kbIDs) > 0 {
 		memory := e.retrieve(ctx, query, []string{MemoryKB(chatID)}, opts.RAGK/2+1, memoryChars)
 		// Lookup results need room too: a quarter of the context.
-		msgs := e.messages(s, memory, nil, inChars-len([]rune(system))-inChars/4)
+		msgs := e.messages(s, withMemory(memory), nil, inChars-len([]rune(system))-inChars/4)
 		reply, err := e.withTools(ctx, tu, chatID, s.kbIDs, llm.Request{Purpose: "chat · " + c.Title, System: system,
 			Messages: msgs, MaxTokens: maxOut, OnReasoning: onReasoning}, max(inChars/(4*maxLookups), 1000), onDelta)
 		if !errors.Is(err, llm.ErrNoTools) {
@@ -349,7 +469,7 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 			}
 		}
 	}
-	msgs := e.messages(s, memory, images, inChars-len([]rune(system)))
+	msgs := e.messages(s, withMemory(memory), images, inChars-len([]rune(system)))
 	return provider.Stream(ctx, llm.Request{Purpose: "chat · " + c.Title, System: system, Messages: msgs,
 		MaxTokens: maxOut, OnReasoning: onReasoning}, onDelta)
 }
@@ -369,8 +489,11 @@ func (e *Engine) retrieve(ctx context.Context, query string, kbIDs []string, k, 
 // messages turns the history into model messages that fit in maxChars
 // (oldest dropped first) and attaches retrieved memory and pages to the
 // newest user turn (not persisted; the system prompt stays stable).
-func (e *Engine) messages(s setup, memory string, images []llm.Part, maxChars int) []llm.Message {
-	maxChars -= len([]rune(memory)) + 1500*len(images)
+func (e *Engine) messages(s setup, blocks []string, images []llm.Part, maxChars int) []llm.Message {
+	maxChars -= 1500 * len(images)
+	for _, b := range blocks {
+		maxChars -= len([]rune(b))
+	}
 	history := s.history
 	total := 0
 	for i := len(history) - 1; i >= 0; i-- {
@@ -391,18 +514,29 @@ func (e *Engine) messages(s setup, memory string, images []llm.Part, maxChars in
 	}
 	if len(msgs) == 0 || msgs[0].Role != llm.RoleUser {
 		// Some APIs require the conversation to open with a user turn.
-		msgs = append([]llm.Message{llm.TextMessage(llm.RoleUser, "*("+s.chat.PersonaName+" bước vào câu chuyện)*")}, msgs...)
+		msgs = append([]llm.Message{llm.TextMessage(llm.RoleUser, "*("+s.chat.PersonaName+" steps into the story)*")}, msgs...)
 	}
-	if n := len(msgs); msgs[n-1].Role == llm.RoleUser && (memory != "" || len(images) > 0) {
+	if len(s.history) > 0 && msgs[len(msgs)-1].Role == llm.RoleAssistant {
+		// The player sent nothing: the story carries on by itself.
+		msgs = append(msgs, llm.TextMessage(llm.RoleUser, fill(prompts.Get("chat-continue"), s.other, s.chat.PersonaName)))
+	}
+	if n := len(msgs); msgs[n-1].Role == llm.RoleUser && (len(blocks) > 0 || len(images) > 0) {
 		var parts []llm.Part
-		if memory != "" {
-			parts = append(parts, llm.Part{Text: "<memory>\n" + memory + "\n</memory>"})
+		for _, b := range blocks {
+			parts = append(parts, llm.Part{Text: b})
 		}
 		if len(images) > 0 {
-			parts = append(parts, llm.Part{Text: "<reference_pages>Các trang truyện liên quan:</reference_pages>"})
+			parts = append(parts, llm.Part{Text: "<reference_pages>Relevant pages of the source:</reference_pages>"})
 			parts = append(parts, images...)
 		}
 		msgs[n-1].Parts = append(parts, msgs[n-1].Parts...)
+	}
+	// The rules that matter every turn (reply language, never playing the
+	// player) go last, where models follow them best.
+	if n := len(msgs); msgs[n-1].Role == llm.RoleUser {
+		if r := fill(prompts.Get("chat-reminder"), s.other, s.chat.PersonaName); r != "" {
+			msgs[n-1].Parts = append(msgs[n-1].Parts, llm.Part{Text: r})
+		}
 	}
 	return msgs
 }
@@ -443,7 +577,7 @@ func (e *Engine) withTools(ctx context.Context, tu llm.ToolUser, chatID string, 
 		}
 		req.Messages = append(req.Messages, msg)
 		for _, call := range t.Calls {
-			result := "Đã hết lượt tra cứu. Hãy viết câu trả lời từ những gì đã có."
+			result := "No lookups left. Write the reply from what you have."
 			if lookups < maxLookups {
 				lookups++
 				e.emit("chat:lookup", map[string]any{"chatId": chatID, "tool": call.Name, "args": call.Args})
@@ -508,7 +642,8 @@ func (e *Engine) compress(ctx context.Context, chatID string) error {
 	return e.st.MarkSummarized(chatID, last)
 }
 
-func buildSystem(c store.Character, scen *store.Scenario, chat store.Chat) string {
+// quotes: lines characters say in the source, keyed by lower-case name.
+func buildSystem(c store.Character, scen *store.Scenario, chat store.Chat, quotes map[string][]string) string {
 	var sb strings.Builder
 	sb.WriteString(prompts.Get("chat-character") + "\n\n<character>\n")
 	field := func(label, v string) {
@@ -523,6 +658,9 @@ func buildSystem(c store.Character, scen *store.Scenario, chat store.Chat) strin
 	if c.ExampleDialogue != "" {
 		sb.WriteString("Example dialogue:\n" + strings.TrimSpace(c.ExampleDialogue) + "\n")
 	}
+	if q := quotes[strings.ToLower(strings.TrimSpace(c.Name))]; len(q) > 0 {
+		sb.WriteString("Lines they say in the source (match this voice): " + quoteList(q) + "\n")
+	}
 	sb.WriteString("</character>\n")
 	if scen != nil {
 		fmt.Fprintf(&sb, "\n<scenario title=%q>\n%s\n</scenario>\n", scen.Title, strings.TrimSpace(scen.Setting))
@@ -536,7 +674,7 @@ func buildSystem(c store.Character, scen *store.Scenario, chat store.Chat) strin
 // buildSceneSystem makes the model the narrator of a scene in which the player
 // plays {{user}}. Cast members that have a saved character card with the same
 // name get the card's personality and speaking style too.
-func buildSceneSystem(scen store.Scenario, chat store.Chat, cards []store.Character) string {
+func buildSceneSystem(scen store.Scenario, chat store.Chat, cards []store.Character, quotes map[string][]string) string {
 	var sb strings.Builder
 	sb.WriteString(prompts.Get("chat-narrator") + "\n\n")
 	fmt.Fprintf(&sb, "<scenario title=%q>\n%s\n</scenario>\n", scen.Title, strings.TrimSpace(scen.Setting))
@@ -561,6 +699,9 @@ func buildSceneSystem(scen store.Scenario, chat store.Chat, cards []store.Charac
 				fmt.Fprintf(&cast, "  Speaking style: %s\n", strings.TrimSpace(card.SpeakingStyle))
 			}
 		}
+		if q := quotes[key]; len(q) > 0 {
+			fmt.Fprintf(&cast, "  Lines they say in the source: %s\n", quoteList(q))
+		}
 	}
 	if cast.Len() > 0 {
 		sb.WriteString("\n<cast>\n" + cast.String() + "</cast>\n")
@@ -574,6 +715,28 @@ func buildSceneSystem(scen store.Scenario, chat store.Chat, cards []store.Charac
 	}
 	sb.WriteString("</player_character>\n")
 	return fill(sb.String(), Narrator, chat.PersonaName)
+}
+
+func quoteList(q []string) string {
+	out := make([]string, len(q))
+	for i, x := range q {
+		out[i] = `"` + x + `"`
+	}
+	return strings.Join(out, " · ")
+}
+
+// shorten keeps about n runes of s, cut at a sentence end when possible.
+func shorten(s string, n int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	cut := string(r[:n])
+	if i := strings.LastIndexAny(cut, ".!?。"); i > len(cut)/2 {
+		return cut[:i+1]
+	}
+	return cut + "…"
 }
 
 func fill(s, char, user string) string {

@@ -75,10 +75,10 @@ func (e *Engine) divergence(ctx context.Context, chatID string, force bool) erro
 	fresh = fitMessages(fresh, inChars-len([]rune(canon))-len([]rune(before))-2500) // the rest comes next time
 	logText := before
 	if logText == "" {
-		logText = "(trống: chưa có gì khác nguyên tác)"
+		logText = "(empty: nothing differs from the source yet)"
 	}
 	if canon == "" {
-		canon = "(không có bản đồ truyện)"
+		canon = "(no story map)"
 	}
 	out, err := llm.Complete(ctx, p, llm.Request{Purpose: "sổ thay đổi · " + s.chat.Title, MaxTokens: maxOut,
 		System: prompts.Get("analyst-system"),

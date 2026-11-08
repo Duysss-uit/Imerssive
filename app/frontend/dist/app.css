@@ -265,8 +265,29 @@ dialog::backdrop { background: rgba(0, 0, 0, .65); }
 /* scene turns: one bubble per speaker */
 .scene-turn { display: flex; flex-direction: column; gap: 10px; }
 .scene-turn:hover .tools { opacity: 1; }
-.msg.narration .body { background: transparent; border: 1px solid var(--line); color: #d4d4d8; font-style: italic; }
-.msg.narration .body em { font-style: normal; }
+/* narration: plain italic prose, no bubble, a small mark at the left */
+.narr { display: flex; gap: 12px; align-items: flex-start; margin: 4px 0; max-width: 760px; }
+.narr-icon { color: var(--faint); font-style: normal; font-size: 15px; line-height: 1.6; width: 40px; text-align: center; flex: none; }
+.narr .col { min-width: 0; flex: 1; }
+.narr .body { background: none; border: 0; padding: 0; color: #c9c9d1; font-style: italic; font-size: 15px; line-height: 1.6;
+  white-space: pre-wrap; word-wrap: break-word; }
+.narr .body em { font-style: normal; color: #e4e4e7; }
+.narr .tools { display: flex; gap: 2px; margin-top: 4px; opacity: 0; transition: opacity .12s; }
+.narr:hover .tools, .narr .tools.always { opacity: 1; }
+.narr .tools button { padding: 3px 9px; font-size: 12px; background: transparent; color: var(--faint); }
+.narr .tools button:hover { color: var(--text); background: var(--surface-2); }
+.narr.rise { animation: msg-in .35s ease-out both; }
+/* [Timeline]: where on the source's timeline the story is */
+.timeline-mark { display: flex; flex-direction: column; align-items: center; gap: 4px; margin: 8px 0 2px; }
+.timeline-mark > span { font-size: 12.5px; color: var(--muted); background: var(--surface); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px 14px; max-width: 92%; text-align: center; }
+.timeline-mark .tools { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; }
+.timeline-mark:hover .tools, .timeline-mark .tools.always { opacity: 1; }
+.timeline-mark .tools button { padding: 3px 9px; font-size: 12px; background: transparent; color: var(--faint); }
+.timeline-mark.rise { animation: msg-in .35s ease-out both; }
+.msg.rise { animation: msg-in .35s ease-out both; }
+@keyframes msg-in { from { opacity: 0; transform: translateY(8px); } }
+@media (prefers-reduced-motion: reduce) { .narr.rise, .msg.rise { animation: none; } }
 .thinking { color: var(--faint); font-style: italic; animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .45; } }
 

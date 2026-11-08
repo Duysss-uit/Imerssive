@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -66,6 +67,8 @@ func LoadPages(path string) ([]Page, error) {
 // Entity is one profile the ingest pipeline built (character, place, faction...).
 type Entity struct {
 	Name, Type, Profile string
+	Quotes              []string // characteristic lines they say in the source
+	Aliases             []string // other names and labels the source used for them
 }
 
 // Entities lists the profiles stored for the knowledge bases.
@@ -81,7 +84,14 @@ func (l *Lore) Entities(ctx context.Context, kbIDs []string) ([]Entity, error) {
 			return nil, err
 		}
 		for _, h := range hits {
-			out = append(out, ParseEntity(h.Str("name"), h.Text))
+			e := ParseEntity(h.Str("name"), h.Text)
+			if q := h.Str("quotes"); q != "" {
+				e.Quotes = strings.Split(q, "\n")
+			}
+			if a := h.Str("aliases"); a != "" {
+				e.Aliases = strings.Split(a, "\n")
+			}
+			out = append(out, e)
 		}
 	}
 	return out, nil
@@ -115,11 +125,14 @@ func MapEntry(c store.Chapter) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%d. %s", c.No, c.Title)
 	if c.Pages != "" {
-		fmt.Fprintf(&sb, " (tr. %s)", c.Pages)
+		fmt.Fprintf(&sb, " (p. %s)", c.Pages)
+	}
+	if c.When != "" {
+		fmt.Fprintf(&sb, " [When: %s]", c.When)
 	}
 	sb.WriteString(": " + strings.TrimSpace(c.Summary))
 	if len(c.Cast) > 0 {
-		sb.WriteString(" [Nhân vật: " + strings.Join(c.Cast, ", ") + "]")
+		sb.WriteString(" [Characters: " + strings.Join(c.Cast, ", ") + "]")
 	}
 	return sb.String()
 }
@@ -163,7 +176,7 @@ func (l *Lore) Map(kbIDs []string, maxChars int) string {
 			for i, c := range w.chs {
 				lines[i] = entry(c)
 			}
-			parts = append(parts, fmt.Sprintf("[%s · %d chương]\n%s", w.name, len(w.chs), strings.Join(lines, "\n")))
+			parts = append(parts, fmt.Sprintf("[%s · %d chapters]\n%s", w.name, len(w.chs), strings.Join(lines, "\n")))
 		}
 		return strings.Join(parts, "\n\n")
 	}
@@ -194,7 +207,7 @@ func (l *Lore) Map(kbIDs []string, maxChars int) string {
 		}
 		works[i].chs = kept
 	}
-	return render(short) + fmt.Sprintf("\n(Bản đồ rút gọn: chỉ hiện một phần trong %d chương; đọc các chương khác bằng read_chapter.)", total)
+	return render(short) + fmt.Sprintf("\n(Shortened map: only some of the %d chapters are shown; read the others with read_chapter.)", total)
 }
 
 func firstSentence(s string) string {
@@ -251,31 +264,31 @@ func (l *Lore) Run(ctx context.Context, kbIDs []string, c llm.ToolCall, maxChars
 		FromPage json.RawMessage `json:"from_page"`
 	}
 	if err := json.Unmarshal([]byte(c.Args), &args); err != nil && strings.TrimSpace(c.Args) != "" {
-		return "Lỗi: tham số không phải JSON hợp lệ."
+		return "Error: the arguments are not valid JSON."
 	}
 	switch c.Name {
 	case SearchTool.Name:
 		if strings.TrimSpace(args.Query) == "" {
-			return `Lỗi: gọi search_story với {"query": "..."}.`
+			return `Error: call search_story with {"query": "..."}.`
 		}
 		hits, err := l.Search(ctx, kbIDs, args.Query, 6)
 		if err != nil {
-			return "Lỗi khi tìm: " + err.Error()
+			return "Search failed: " + err.Error()
 		}
 		if len(hits) == 0 {
-			return "Không tìm thấy gì cho câu hỏi này."
+			return "Nothing found for this query."
 		}
 		return rag.FormatContext(hits, maxChars)
 	case ReadChapterTool.Name:
 		n := looseInt(args.Chapter)
 		if n <= 0 {
-			return `Lỗi: gọi read_chapter với {"chapter": <số chương trong bản đồ>}.`
+			return `Error: call read_chapter with {"chapter": <chapter number in the story map>}.`
 		}
 		return l.ReadChapter(kbIDs, args.Work, n, looseInt(args.FromPage), maxChars)
 	case CharacterTool.Name:
 		return l.Character(ctx, kbIDs, args.Name, maxChars)
 	}
-	return "Lỗi: không có công cụ " + c.Name + "."
+	return "Error: there is no tool named " + c.Name + "."
 }
 
 // looseInt reads a number the model may have sent as a number or a string.
@@ -309,25 +322,25 @@ func (l *Lore) ReadChapter(kbIDs []string, work string, n, fromPage, maxChars in
 		}
 	}
 	if ch == nil {
-		return fmt.Sprintf("Không có chương %d (bản đồ có %d chương).", n, count)
+		return fmt.Sprintf("There is no chapter %d (the map has %d chapters).", n, count)
 	}
 	pages, err := LoadPages(TextPath(l.PagesDir, ch.SourceID))
 	if err != nil {
-		return "Không đọc được văn bản của chương này."
+		return "The text of this chapter could not be read."
 	}
 	first, last := pageRange(ch.Pages)
 	if fromPage > first {
 		first = fromPage
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Chương %d: %s\n", ch.No, ch.Title)
+	fmt.Fprintf(&sb, "Chapter %d: %s\n", ch.No, ch.Title)
 	for _, p := range pages {
 		if p.Page < first || (last > 0 && p.Page > last) {
 			continue
 		}
-		block := fmt.Sprintf("\n[Trang %d]\n%s\n", p.Page, strings.TrimSpace(p.Text))
+		block := fmt.Sprintf("\n[Page %d]\n%s\n", p.Page, strings.TrimSpace(p.Text))
 		if sb.Len() > 200 && len([]rune(sb.String()))+len([]rune(block)) > maxChars {
-			fmt.Fprintf(&sb, "\n(Còn tiếp: gọi read_chapter với chapter=%d, from_page=%d.)", ch.No, p.Page)
+			fmt.Fprintf(&sb, "\n(Continues: call read_chapter with chapter=%d, from_page=%d.)", ch.No, p.Page)
 			return sb.String()
 		}
 		sb.WriteString(block)
@@ -351,15 +364,15 @@ func pageRange(s string) (first, last int) {
 func (l *Lore) Character(ctx context.Context, kbIDs []string, name string, maxChars int) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return `Lỗi: gọi get_character với {"name": "..."}.`
+		return `Error: call get_character with {"name": "..."}.`
 	}
 	ents, err := l.Entities(ctx, kbIDs)
 	if err != nil {
-		return "Lỗi khi đọc hồ sơ: " + err.Error()
+		return "Could not read the profiles: " + err.Error()
 	}
 	var partial []Entity
 	for _, e := range ents {
-		if strings.EqualFold(strings.TrimSpace(e.Name), name) {
+		if strings.EqualFold(strings.TrimSpace(e.Name), name) || slices.ContainsFunc(e.Aliases, func(a string) bool { return strings.EqualFold(strings.TrimSpace(a), name) }) {
 			return headRunes(fmt.Sprintf("%s (%s): %s", e.Name, e.Type, e.Profile), maxChars)
 		}
 		low, q := strings.ToLower(e.Name), strings.ToLower(name)
@@ -376,9 +389,9 @@ func (l *Lore) Character(ctx context.Context, kbIDs []string, name string, maxCh
 		for _, e := range partial {
 			names = append(names, e.Name)
 		}
-		return "Có nhiều hồ sơ gần đúng: " + strings.Join(names, ", ") + ". Gọi lại với tên chính xác."
+		return "Several profiles match: " + strings.Join(names, ", ") + ". Call again with the exact name."
 	}
-	return "Không có hồ sơ tên " + name + ". Thử search_story."
+	return "No profile named " + name + ". Try search_story."
 }
 
 func headRunes(s string, n int) string {

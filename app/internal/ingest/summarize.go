@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -256,26 +257,36 @@ func (s *Service) summarizeKB(ctx context.Context, kbID string, fromStart bool) 
 	// 2. Read each chapter in windows, updating its summary as it goes. The
 	// map so far is the context, so chapters go one after another.
 	perSource := map[string][]store.Chapter{}
-	var results []sectionResult
+	var results []sectionResult // every passage read, in story order
+	var base []sectionResult    // the stored profiles, when the map continues
+	if !fromStart {
+		base = []sectionResult{asResult(s.existingEntities(ctx, kbID))}
+	}
 	var docs []rag.Doc
 	for i, t := range todos {
 		no := len(mapped) + 1
-		label := fmt.Sprintf("Chương %d · %s", no, t.ch.title)
+		label := fmt.Sprintf("Chapter %d · %s", no, t.ch.title)
 		storySoFar := tailRunes(lore.RenderMap(mapped), inChars/5)
-		// What is left for the passage: the prompt itself, the story so far and
-		// the chapter's running summary take the rest.
-		window := max(inChars-len([]rune(storySoFar))-4500, 1200)
+		knownChars := inChars / 6
+		// What is left for the passage: the prompt itself, the story so far, the
+		// characters known and the chapter's running summary take the rest.
+		window := max(inChars-len([]rune(storySoFar))-knownChars-4500, 1200)
 		spans := pack(paragraphs(t.ch.units), window, 0)
-		running := ""
+		running, when := "", ""
 		var cast []string
 		for w, sp := range spans {
 			progress(fmt.Sprintf("Lập bản đồ truyện: chương %d/%d, đoạn %d/%d…", i+1, len(todos), w+1, len(spans)))
-			r, err := s.readWindow(ctx, summarizer, maxOut, title, label, w, len(spans), storySoFar, running, sp)
+			sofar, _ := mergeEntities(append(slices.Clone(base), results...))
+			known := knownCharacters(sofar, knownChars)
+			r, err := s.readWindow(ctx, summarizer, maxOut, title, label, w, len(spans), storySoFar, known, running, sp)
 			if err != nil {
 				return fmt.Errorf("đọc %s: %w", label, err)
 			}
 			if r.Summary != "" {
 				running = r.Summary
+			}
+			if w := strings.TrimSpace(r.When); w != "" {
+				when = w
 			}
 			results = append(results, r)
 			for _, e := range r.Entities {
@@ -285,18 +296,27 @@ func (s *Service) summarizeKB(ctx context.Context, kbID string, fromStart bool) 
 			}
 		}
 		c := store.Chapter{KBID: kbID, SourceID: t.src.ID, Idx: len(perSource[t.src.ID]), No: no,
-			Title: t.ch.title, Pages: t.ch.pages(), Summary: running, Cast: cast[:min(len(cast), 12)]}
+			Title: t.ch.title, Pages: t.ch.pages(), Summary: running, When: when, Cast: cast[:min(len(cast), 12)]}
 		mapped = append(mapped, c)
 		perSource[t.src.ID] = append(perSource[t.src.ID], c)
 		docs = append(docs, rag.Doc{ID: fmt.Sprintf("%s:ch:%d", t.src.ID, c.Idx), Text: c.Title + ": " + c.Summary,
 			Metadata: meta(t.src, rag.LevelSection, c.Pages, "")})
 	}
 
-	// 3. Profiles: what the new chapters say, merged into the existing profiles.
+	// 3. Profiles: what the new chapters say, merged into the existing
+	// profiles, every label of a character under one name.
 	progress("Cập nhật hồ sơ nhân vật & địa danh…")
-	entities := mergeEntities(results)
-	if !fromStart {
-		entities = withExisting(s.existingEntities(ctx, kbID), entities)
+	entities, ids := mergeEntities(append(base, results...))
+	for src, chs := range perSource {
+		for i := range chs {
+			var cast []string
+			for _, name := range chs[i].Cast {
+				if n := ids.Resolve(name); !containsFold(cast, n) {
+					cast = append(cast, n)
+				}
+			}
+			perSource[src][i].Cast = cast
+		}
 	}
 	err = parallel(ctx, len(entities), opts.Concurrency, func(i int) error {
 		return s.mergeProfile(ctx, summarizer, maxOut, inChars, title, entities[i])
@@ -306,8 +326,15 @@ func (s *Service) summarizeKB(ctx context.Context, kbID string, fromStart bool) 
 	}
 	kbSrc := store.Source{KBID: kbID} // profiles belong to the work, not a document
 	for i, e := range entities {
+		m := meta(kbSrc, rag.LevelEntity, "", e.Name)
+		if len(e.quotes) > 0 {
+			m["quotes"] = strings.Join(e.quotes, "\n")
+		}
+		if len(e.aliases) > 0 {
+			m["aliases"] = strings.Join(e.aliases, "\n")
+		}
 		docs = append(docs, rag.Doc{ID: fmt.Sprintf("%s:ent:%d", kbID, i),
-			Text: fmt.Sprintf("%s (%s): %s", e.Name, e.Type, e.profile), Metadata: meta(kbSrc, rag.LevelEntity, "", e.Name)})
+			Text: fmt.Sprintf("%s (%s): %s", e.Name, e.Type, e.profile), Metadata: m})
 	}
 
 	// 4. Swap in the new map entries and profiles. Profiles are rewritten as a
@@ -342,18 +369,21 @@ func (s *Service) summarizeKB(ctx context.Context, kbID string, fromStart bool) 
 
 // readWindow reads passage w of n of a chapter and returns the chapter's
 // summary so far (running, updated with the passage) and who appears in it.
-func (s *Service) readWindow(ctx context.Context, p llm.Provider, maxOut int, title, label string, w, n int, storySoFar, running string, sp span) (sectionResult, error) {
+func (s *Service) readWindow(ctx context.Context, p llm.Provider, maxOut int, title, label string, w, n int, storySoFar, known, running string, sp span) (sectionResult, error) {
 	if storySoFar == "" {
-		storySoFar = "(Đây là chương đầu tiên.)"
+		storySoFar = "(This is the first chapter.)"
+	}
+	if known == "" {
+		known = "(No one yet.)"
 	}
 	if running == "" {
-		running = "(Chưa có: đây là đoạn đầu của chương.)"
+		running = "(None yet: this is the start of the chapter.)"
 	}
 	out, err := llm.Complete(ctx, p, llm.Request{Purpose: fmt.Sprintf("bản đồ %s · %s · đoạn %d/%d", title, label, w+1, n),
 		System: prompts.Get("analyst-system"), MaxTokens: maxOut,
 		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, prompts.Get("chapter", "title", title, "chapter", label,
 			"part", strconv.Itoa(w+1), "parts", strconv.Itoa(n), "pages", sp.pages(),
-			"story_so_far", storySoFar, "notes", running, "text", sp.Text))}})
+			"story_so_far", storySoFar, "known", known, "notes", running, "text", sp.Text))}})
 	if err != nil {
 		return sectionResult{}, err
 	}
@@ -434,32 +464,6 @@ func (s *Service) existingEntities(ctx context.Context, kbID string) []Entity {
 		log.Printf("ingest: đọc hồ sơ cũ: %v", err)
 	}
 	return ents
-}
-
-// withExisting puts each existing profile first in the notes of the entity it
-// describes, and keeps profiles the new parts don't mention unchanged.
-func withExisting(old []Entity, fresh []*entity) []*entity {
-	byName := map[string]*entity{}
-	for _, e := range fresh {
-		byName[strings.ToLower(strings.TrimSpace(e.Name))] = e
-	}
-	var out []*entity
-	for _, o := range old {
-		key := strings.ToLower(strings.TrimSpace(o.Name))
-		if e, ok := byName[key]; ok {
-			if e.notes == nil || e.notes[0] != o.Profile {
-				e.notes = append([]string{o.Profile}, e.notes...)
-			}
-			if o.Type != "" {
-				e.Type = o.Type
-			}
-			continue
-		}
-		e := &entity{Name: o.Name, Type: o.Type, notes: []string{o.Profile}}
-		byName[key] = e
-		out = append(out, e)
-	}
-	return append(out, fresh...)
 }
 
 func sortBySeq(srcs []store.Source) {

@@ -7,4 +7,4 @@ Return ONLY a JSON object with these string fields:
  "personality": "traits, values, fears, quirks (one paragraph)", "speakingStyle": "how they talk: tone, verbal tics, forms of address, sample phrases",
  "greeting": "the first message they send to start a roleplay, in character, a few sentences, with *actions* in asterisks",
  "exampleDialogue": "3-4 short exchanges formatted as {{user}}: ... / {{char}}: ..."}
-Stay faithful to the source. Write in the same language as the work.
+Stay faithful to the source. Write every field in the language the user writes in: the language of their direction above, or English when there is none, even if the work is in another language. Keep proper names as they are in the source.

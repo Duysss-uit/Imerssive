@@ -21,4 +21,4 @@ Rewrite the log so it covers everything up to the end of the new messages. Recor
 - Changed relationships, attitudes, promises, debts, plans in motion.
 - What {player} has done and become known for.
 
-Keep earlier entries that still hold; update or drop those that changed. Don't restate what simply follows the source. Write short bullet points under these headings: "Hiện tại", "Khác nguyên tác", "Trạng thái", "Quan hệ". At most about fifteen bullets in all. Write in the language of the conversation. Output only the log.
+Keep earlier entries that still hold; update or drop those that changed. Don't restate what simply follows the source. Write short bullet points under these headings: "Now", "Different from the source", "States", "Relationships". At most about fifteen bullets in all. Write in the language {player} writes in (English if unsure). Output only the log.
