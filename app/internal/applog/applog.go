@@ -42,8 +42,20 @@ func Setup(dir string) (*Logs, error) {
 	}
 	prune(dir)
 	l := &Logs{Dir: dir, app: &daily{dir: dir, prefix: "app"}, model: &daily{dir: dir, prefix: "model"}}
-	log.SetOutput(io.MultiWriter(os.Stderr, l.app))
+	log.SetOutput(teeWriter{l.app, os.Stderr})
 	return l, nil
+}
+
+// teeWriter writes to every writer and ignores their errors: the windowed app
+// has no stderr, and a failed write there must not stop the log file
+// (io.MultiWriter stops at the first error).
+type teeWriter []io.Writer
+
+func (t teeWriter) Write(p []byte) (int, error) {
+	for _, w := range t {
+		w.Write(p)
+	}
+	return len(p), nil
 }
 
 func (l *Logs) Close() {
@@ -100,6 +112,43 @@ func (l *Logs) Model(c llm.Call, level string) {
 	}
 	if c.Response != "" || len(c.Calls) == 0 {
 		section(&b, "MODEL TRẢ VỀ", or(c.Response, "(trống)"))
+	}
+	b.WriteString("\n")
+	l.model.Write([]byte(b.String()))
+}
+
+// Image appends one drawing to the model log: what was asked, the reference
+// pictures, and what the image model answered (the picture's size, or its
+// error, refusal or explanation in full).
+func (l *Logs) Image(c llm.ImageCall, level string) {
+	if level == ModelOff {
+		return
+	}
+	status := fmt.Sprintf("OK · ảnh %s ~%d KB", c.Image.MIME, len(c.Image.B64)*3/4/1024)
+	if c.Err != nil {
+		status = "LỖI: " + c.Err.Error()
+	}
+	log.Printf("model ảnh: %s · %s/%s (%s) · %s · %d ảnh tham chiếu · %s", c.Request.Purpose, c.Provider, c.Model, c.API,
+		c.Duration.Round(100*time.Millisecond), len(c.Request.Refs), status)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "==================== %s ====================\n", c.Started.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "Mục đích : %s\n", or(c.Request.Purpose, "?"))
+	fmt.Fprintf(&b, "Provider : %s · %s (model ảnh, cách vẽ %s)\n", c.Provider, or(c.Model, "(mặc định)"), c.API)
+	fmt.Fprintf(&b, "Thời gian: %s · khung %s\n", c.Duration.Round(time.Millisecond), or(c.Request.Aspect, "square"))
+	fmt.Fprintf(&b, "Kết quả  : %s\n", status)
+	if level == ModelFull {
+		section(&b, "PROMPT GỬI MODEL ẢNH", c.Request.Prompt)
+	}
+	if len(c.Request.Refs) > 0 {
+		var refs []string
+		for i, r := range c.Request.Refs {
+			refs = append(refs, fmt.Sprintf("%d. %s [%s, ~%d KB]", i+1, r.Label, r.MIME, len(r.B64)*3/4/1024))
+		}
+		section(&b, "ẢNH THAM CHIẾU", strings.Join(refs, "\n"))
+	}
+	if c.Err != nil {
+		section(&b, "MODEL ẢNH BÁO LỖI / TỪ CHỐI", c.Err.Error())
 	}
 	b.WriteString("\n")
 	l.model.Write([]byte(b.String()))

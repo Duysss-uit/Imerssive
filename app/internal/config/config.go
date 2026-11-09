@@ -15,6 +15,7 @@ type Paths struct {
 	Chroma    string // vector store
 	ModelsDir string // embedding model cache
 	Logs      string // activity and model logs
+	Images    string // illustrations drawn in chats
 }
 
 func Resolve() (Paths, error) {
@@ -35,8 +36,9 @@ func Resolve() (Paths, error) {
 		Chroma:    filepath.Join(base, "chroma"),
 		ModelsDir: filepath.Join(base, "models"),
 		Logs:      filepath.Join(base, "logs"),
+		Images:    filepath.Join(base, "images"),
 	}
-	for _, d := range []string{p.DataDir, p.Sources, p.Pages, p.Chroma, p.ModelsDir, p.Logs} {
+	for _, d := range []string{p.DataDir, p.Sources, p.Pages, p.Chroma, p.ModelsDir, p.Logs, p.Images} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return Paths{}, err
 		}

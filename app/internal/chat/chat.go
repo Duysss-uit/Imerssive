@@ -38,6 +38,10 @@ type Options struct {
 	// AutoProfiles adds the profiles of characters named in the last few
 	// messages to the turn, within a share of the model's context.
 	AutoProfiles bool
+	// Illustrations (when an image provider is set): reference pictures per
+	// drawing, and an art style added to every prompt.
+	ImageMaxRefs int
+	ImageStyle   string
 }
 
 // vectors is the part of the vector store chat uses (rag.Store; swapped in tests).
@@ -60,11 +64,13 @@ type Engine struct {
 	mu        sync.Mutex
 	running   map[string]context.CancelFunc
 	diverging map[string]bool // chats whose divergence log is being updated
+	drawing   map[string]bool // chats with an illustration being drawn from the button
+	img       Imaging
 }
 
 func New(st *store.Store, r vectors, lr *lore.Lore, spaces rag.Spaces, resolve llm.Resolver, opts func() Options, emit func(string, any)) *Engine {
 	return &Engine{st: st, rag: r, lore: lr, spaces: spaces, resolve: resolve, opts: opts, emit: emit,
-		running: map[string]context.CancelFunc{}, diverging: map[string]bool{}}
+		running: map[string]context.CancelFunc{}, diverging: map[string]bool{}, drawing: map[string]bool{}}
 }
 
 func MemoryKB(chatID string) string { return "chat:" + chatID }
@@ -129,6 +135,7 @@ func (e *Engine) Delete(ctx context.Context, chatID string) error {
 	if err := e.rag.Delete(ctx, rag.Filter{KBIDs: []string{MemoryKB(chatID)}}); err != nil {
 		log.Printf("chat: delete memory: %v", err)
 	}
+	e.deleteImages(chatID)
 	return e.st.DeleteChat(chatID)
 }
 
@@ -411,7 +418,7 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 		return "", err
 	}
 	maxOut, inChars := llm.Budget(provider, opts.MaxTokens)
-	system := e.system(ctx, s, inChars/10) + e.loreBlock(s, inChars/5)
+	system := e.system(ctx, s, inChars/10) + e.loreBlock(s, inChars/5) + e.imageSystem()
 	var blocks []string // added to the newest user turn, not saved
 	if opts.AutoProfiles {
 		if p := e.presentProfiles(ctx, s, inChars/8); p != "" {
@@ -445,11 +452,11 @@ func (e *Engine) generate(ctx context.Context, chatID string) (string, error) {
 
 	// With tools, the model looks the source up itself; only this
 	// conversation's own memory is retrieved for it.
-	if tu, ok := provider.(llm.ToolUser); ok && len(s.kbIDs) > 0 {
+	if tu, ok := provider.(llm.ToolUser); ok && (len(s.kbIDs) > 0 || e.imagesOn()) {
 		memory := e.retrieve(ctx, query, []string{MemoryKB(chatID)}, opts.RAGK/2+1, memoryChars)
 		// Lookup results need room too: a quarter of the context.
 		msgs := e.messages(s, withMemory(memory), nil, inChars-len([]rune(system))-inChars/4)
-		reply, err := e.withTools(ctx, tu, chatID, s.kbIDs, llm.Request{Purpose: "chat · " + c.Title, System: system,
+		reply, err := e.withTools(ctx, tu, s, llm.Request{Purpose: "chat · " + c.Title, System: system,
 			Messages: msgs, MaxTokens: maxOut, OnReasoning: onReasoning}, max(inChars/(4*maxLookups), 1000), onDelta)
 		if !errors.Is(err, llm.ErrNoTools) {
 			return reply, err
@@ -510,7 +517,7 @@ func (e *Engine) messages(s setup, blocks []string, images []llm.Part, maxChars 
 		if m.Role == "assistant" {
 			role = llm.RoleAssistant
 		}
-		msgs = append(msgs, llm.TextMessage(role, m.Content))
+		msgs = append(msgs, llm.TextMessage(role, forModel(m.Content)))
 	}
 	if len(msgs) == 0 || msgs[0].Role != llm.RoleUser {
 		// Some APIs require the conversation to open with a user turn.
@@ -544,12 +551,20 @@ func (e *Engine) messages(s setup, blocks []string, images []llm.Part, maxChars 
 // withTools runs a reply in which the model may look the source up first. It
 // returns llm.ErrNoTools, before anything is streamed, when the model can't
 // call tools.
-func (e *Engine) withTools(ctx context.Context, tu llm.ToolUser, chatID string, kbIDs []string, req llm.Request, resultChars int, onDelta func(string)) (string, error) {
+func (e *Engine) withTools(ctx context.Context, tu llm.ToolUser, s setup, req llm.Request, resultChars int, onDelta func(string)) (string, error) {
+	chatID, kbIDs := s.chat.ID, s.kbIDs
+	var tools []llm.Tool
+	if len(kbIDs) > 0 {
+		tools = append(tools, lore.Tools...)
+	}
+	if e.imagesOn() {
+		tools = append(tools, ImageTool)
+	}
 	var reply strings.Builder
 	purpose := req.Purpose
-	lookups := 0
+	lookups, drawn := 0, 0
 	for round := 1; ; round++ {
-		req.Tools = lore.Tools
+		req.Tools = tools
 		req.NoMoreTools = lookups >= maxLookups
 		if round > 1 {
 			req.Purpose = fmt.Sprintf("%s · lượt %d", purpose, round)
@@ -578,7 +593,22 @@ func (e *Engine) withTools(ctx context.Context, tu llm.ToolUser, chatID string, 
 		req.Messages = append(req.Messages, msg)
 		for _, call := range t.Calls {
 			result := "No lookups left. Write the reply from what you have."
-			if lookups < maxLookups {
+			if call.Name == ImageTool.Name {
+				result = "Only one picture per reply. Go on with the reply in text."
+				if drawn == 0 && e.imagesOn() {
+					drawn++
+					var marker string
+					if marker, result = e.draw(ctx, s, call.Args); marker != "" {
+						// The picture is part of the reply, where the model drew it.
+						if reply.Len() > 0 {
+							reply.WriteString("\n\n")
+							onDelta("\n\n")
+						}
+						reply.WriteString(marker)
+						onDelta(marker)
+					}
+				}
+			} else if lookups < maxLookups {
 				lookups++
 				e.emit("chat:lookup", map[string]any{"chatId": chatID, "tool": call.Name, "args": call.Args})
 				result = e.lore.Run(ctx, kbIDs, call, resultChars)

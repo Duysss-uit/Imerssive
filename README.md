@@ -70,7 +70,29 @@ Mỗi bước chỉ bắt đầu khi mọi tài liệu đang chờ của bộ tr
 4. **Sổ thay đổi:** cứ `chat.divergence_every` lượt (mặc định 3), model tóm tắt ghi lại những gì câu chuyện đã khác nguyên tác vì lựa chọn của người chơi (ai chết, quan hệ đổi, đang ở đâu…). Sổ này đứng trên nguyên tác: model tra nguyên tác rồi điều chỉnh theo sổ. Xem, sửa hoặc cập nhật ngay ở nút ⋯ trong màn hình chat.
 5. **Gửi khi ô chat trống:** model tự viết tiếp câu chuyện (các nhân vật khác hành động, cảnh tiến triển), không lưu tin nhắn trống nào.
 6. **Quay lại / rẽ nhánh:** ở mỗi tin nhắn, “↩ Quay lại đây” xoá các tin sau nó để chat tiếp từ đó (sổ thay đổi trở về như lúc ấy, ký ức dài hạn viết từ các tin đã xoá cũng bị bỏ); “⑂ Rẽ nhánh” mở một cuộc trò chuyện mới tiếp nối từ tin đó, cuộc cũ giữ nguyên.
-7. Khi số tin nhắn vượt `chat.window`, nửa cũ nhất được tóm tắt thành ghi chú ký ức, embed vào RAG (`level=memory`) rồi rời khỏi context.
+7. **Ảnh minh hoạ.** Cài đặt chia hai khu: **Model ngôn ngữ** (chat, tóm tắt, vision) và **Tạo ảnh minh hoạ**. Provider có trường `purpose`: provider ảnh không chọn được cho chat, và model ngôn ngữ không chọn được để vẽ. Model chat là model quyết định vẽ gì; provider ảnh chỉ vẽ theo prompt và ảnh tham chiếu nó nhận.
+   - **Nút “🖼 Tạo ảnh”** có trên mọi tin nhắn (của người chơi lẫn của model) khi đã chọn provider ảnh. Khi bấm, model chat đọc đoạn hội thoại tới tin đó (prompt `image-prompt.md`). Nó được cho biết nhân vật nào trong cảnh có ảnh tham chiếu (ảnh thẻ nhân vật, hoặc trang truyện vẽ họ) và có thể tra truyện bằng `get_character`, `read_chapter`, `search_story` (tối đa 3 lần). Sau đó nó trả về JSON gồm prompt, danh sách nhân vật, các trang tham chiếu và khung ảnh. App gắn ảnh tham chiếu, provider ảnh vẽ, rồi ảnh được thêm vào cuối tin nhắn. Thông báo cuối liệt kê những ảnh tham chiếu đã dùng.
+   - **Tự vẽ** (`image.auto`, mặc định tắt): model chat được thêm tool `generate_image` trong lúc trả lời, tối đa một ảnh mỗi câu trả lời. Phần dặn dò nằm trong `chat-images.md`.
+   - Ảnh tham chiếu của mỗi nhân vật là ảnh thẻ nhân vật nếu có; nếu không thì là trang truyện tranh nhắc tên họ (hoặc bí danh) nhiều nhất. App cũng gắn các trang (chương + trang) model chỉ định, và ảnh minh hoạ trước đó khi cảnh nối tiếp. Số ảnh tham chiếu giới hạn ở `image.max_refs`.
+   - Ảnh lưu trong `images/`; trong tin nhắn, ảnh là dòng `[Image: …]`. Khi đọc lại lịch sử, model chỉ thấy ghi chú “đã cho người chơi xem ảnh: …”.
+   - Mỗi provider ảnh có nút “Vẽ thử” và nút “Tải danh sách” (checkpoint của ComfyUI hoặc SD WebUI). Có ba cách vẽ, chọn trong form provider:
+   - **chat**: Chat Completions trả về ảnh, ví dụ OpenRouter với Gemini image. Nhận nhiều ảnh tham chiếu.
+   - **images**: OpenAI Images API (`gpt-image-1` dùng `/images/edits` kèm ảnh tham chiếu).
+   - **sdwebui**: Stable Diffusion WebUI hoặc Forge cục bộ. Chỉ vẽ theo prompt; khi cảnh nối tiếp thì vẽ đè (img2img) lên ảnh trước.
+   - **comfyui**: chạy workflow ComfyUI của bạn (mặc định `http://127.0.0.1:8188`). Xuất workflow bằng *Export (API)*, rồi dán vào form provider hoặc chọn file JSON. Có hai ô: workflow có ảnh tham chiếu (IP-Adapter, PuLID, Qwen-Image-Edit, Flux Kontext…) và workflow không có ảnh tham chiếu (txt2img). Nếu cảnh có ảnh tham chiếu thì app chạy workflow thứ nhất, không có thì chạy workflow thứ hai. Có nút dán mẫu SDXL cơ bản. Đặt các chỗ trống sau vào ô của node:
+     - `{prompt}`: bắt buộc.
+     - `{negative}`, `{width}`, `{height}`, `{seed}`: ba chỗ trống cuối được điền bằng số.
+     - `{model}`: lấy từ ô Model của provider.
+     - `{ref1}`, `{ref2}`…: tên ảnh tham chiếu đã tải lên ComfyUI, đặt vào ô image của node LoadImage. Thiếu ảnh thì lặp lại các ảnh đang có.
+     - `{ref_labels}`: dòng mô tả ảnh tham chiếu nào là ai.
+
+     Workflow mẫu đã chạy thử nằm trong `workflows/comfyui/`:
+     - `sdxl-turbo-txt2img.json`: không ảnh tham chiếu.
+     - `sdxl-turbo-ipadapter.json`: 2 ảnh tham chiếu qua IP-Adapter Plus.
+
+     Cả hai dùng DreamShaper XL Turbo, 7 bước, khoảng 20–60 giây một ảnh trên GPU 6GB. Workflow IP-Adapter cần custom node `ComfyUI_IPAdapter_plus`, model `ip-adapter-plus_sdxl_vit-h.safetensors` (trong `models/ipadapter`) và `CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors` (trong `models/clip_vision`). Với ComfyUI Desktop, các model này đặt trong thư mục model dùng chung (`ComfyUI-Shared/models`).
+     App tải ảnh tham chiếu lên qua `/upload/image`, gửi `/prompt`, chờ ở `/history`, rồi lấy ảnh của node SaveImage. Workflow sai định dạng hoặc thiếu `{prompt}` sẽ bị từ chối ngay lúc lưu provider.
+8. Khi số tin nhắn vượt `chat.window`, nửa cũ nhất được tóm tắt thành ghi chú ký ức, embed vào RAG (`level=memory`) rồi rời khỏi context.
 
 ## Cài đặt
 
@@ -106,7 +128,7 @@ Lần đầu xử lý tài liệu, app sẽ tải model embedding (khoảng 220 
 ## Dữ liệu
 
 Tất cả nằm trong `%APPDATA%\Immersive` (đổi được bằng biến `IMMERSIVE_DATA_DIR`):
-`app.db` (SQLite), `chroma/` (vector), `sources/` (bản sao tài liệu), `pages/` (ảnh trang truyện tranh), `models/`, `logs/`.
+`app.db` (SQLite), `chroma/` (vector), `sources/` (bản sao tài liệu), `pages/` (ảnh trang truyện tranh), `images/` (ảnh minh hoạ trong chat), `models/`, `logs/`.
 
 **Prompt:** mọi prompt gửi cho model nằm trong các file `.md` ở thư mục `prompts/` cạnh `Immersive.exe` (nếu thư mục đó không ghi được thì ở `%APPDATA%\Immersive\prompts`). Sửa file là có hiệu lực ở lần gọi model tiếp theo; xoá một file để quay về bản mặc định. File bạn chưa sửa được tự nâng lên bản mặc định mới khi cập nhật app; file đã sửa thì giữ nguyên. Đầu mỗi file có ghi chú (không gửi cho model) giải thích công dụng và các biến `{title}`, `{text}`…; `{{char}}`/`{{user}}` là tên nhân vật và người chơi. Bản mặc định nằm ở `app/internal/prompts/defaults/`. Nút trong Cài đặt → Prompt mở thư mục này.
 

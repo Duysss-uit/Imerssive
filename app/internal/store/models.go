@@ -1,6 +1,13 @@
 package store
 
-// Provider is a user-configured LLM endpoint. The API key lives in the OS keyring.
+// Provider purposes: a language model (chat, summaries, vision) or a model
+// that draws illustrations.
+const (
+	PurposeLLM   = "" // also "llm"
+	PurposeImage = "image"
+)
+
+// Provider is a user-configured model endpoint. The API key lives in the OS keyring.
 type Provider struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
@@ -12,8 +19,16 @@ type Provider struct {
 	Effort      string  `json:"effort"`
 	Thinking    string  `json:"thinking"` // "" = model default, "off" = ask the model not to think
 	// ContextWindow is the model's context length in tokens; 0 = detect it.
-	ContextWindow int  `json:"contextWindow"`
-	HasKey        bool `json:"hasKey"`
+	ContextWindow int `json:"contextWindow"`
+	// ImageAPI is how the provider draws when it is the image provider:
+	// chat | images | sdwebui ("" = the usual one for its kind).
+	ImageAPI string `json:"imageApi"`
+	// ComfyUI workflows (API format, with {prompt}, {ref1}... placeholders):
+	// for drawings with reference pictures, and without.
+	Workflow      string `json:"workflow"`
+	WorkflowNoRef string `json:"workflowNoRef"`
+	HasKey        bool   `json:"hasKey"`
+	Purpose       string `json:"purpose"` // "" (language model) | "image"
 }
 
 // KnowledgeBase groups source documents (a novel, a manga series...) that

@@ -5,9 +5,11 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +39,7 @@ var defaultSettings = map[string]string{
 	"provider.chat":          "",
 	"provider.summarize":     "", // empty = same as chat
 	"provider.vision":        "", // empty = same as chat
+	"provider.image":         "", // empty = no illustrations
 	"embed.text_model":       "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 	"embed.image_model":      "Qdrant/clip-ViT-B-32-vision",
 	"ingest.chapter_chars":   "40000",
@@ -52,6 +55,9 @@ var defaultSettings = map[string]string{
 	"chat.image_k":           "2",
 	"chat.divergence_every":  "3",
 	"chat.auto_profiles":     "true",
+	"image.auto":             "false", // the model may draw by itself in replies (the Tạo ảnh button works whenever an image provider is set)
+	"image.max_refs":         "4",
+	"image.style":            "",
 	"worker.idle_minutes":    "5",
 	"worker.python":          "",               // empty = auto-detect worker/.venv
 	"log.model":              applog.ModelFull, // full | response | off
@@ -102,6 +108,7 @@ func New() (*App, error) {
 		return nil, err
 	}
 	st.MarkInterruptedSources()
+	markImageProvider(st)
 
 	a := &App{paths: paths, st: st, logs: logs, ctxWin: map[string]detected{}}
 	a.w = worker.New(a.workerOptions())
@@ -109,6 +116,9 @@ func New() (*App, error) {
 	a.ingest = ingest.New(st, a.w, a.rag, a.space, a.resolve, a.ingestOptions, paths.Sources, paths.Pages, a.emit)
 	lr := &lore.Lore{St: st, Vec: a.rag, Spaces: a.space, PagesDir: paths.Pages}
 	a.chat = chat.New(st, a.rag, lr, a.space, a.resolve, a.chatOptions, a.emit)
+	a.chat.SetImaging(chat.Imaging{Imager: a.imager, Dir: paths.Images,
+		Available: func() bool { return a.st.Setting("provider.image") != "" },
+		Auto:      func() bool { return a.setting("image.auto") == "true" }})
 	return a, nil
 }
 
@@ -182,6 +192,8 @@ func (a *App) chatOptions() chat.Options {
 
 		DivergenceEvery: a.intSetting("chat.divergence_every"),
 		AutoProfiles:    a.setting("chat.auto_profiles") == "true",
+		ImageMaxRefs:    a.intSetting("image.max_refs"),
+		ImageStyle:      a.setting("image.style"),
 	}
 }
 
@@ -254,6 +266,31 @@ func (a *App) SaveProvider(in ProviderInput) (store.Provider, error) {
 	if p.Kind == string(llm.KindAnthropic) {
 		p.Vision = true
 	}
+	drawOnly := p.Purpose == store.PurposeImage
+	if drawOnly {
+		p.Vision, p.Effort, p.Thinking, p.ContextWindow = false, "", "", 0
+		if p.ImageAPI == "" {
+			p.ImageAPI = llm.ImageAPIFor(llm.Kind(p.Kind), "")
+		}
+		if p.Kind == string(llm.KindAnthropic) {
+			return p, errors.New("Anthropic không có model tạo ảnh")
+		}
+	} else {
+		p.Purpose, p.ImageAPI, p.Workflow, p.WorkflowNoRef = "", "", "", ""
+	}
+	if drawOnly && p.ImageAPI == llm.ImageAPIComfyUI {
+		if p.Workflow == "" && p.WorkflowNoRef == "" {
+			return p, errors.New("chưa có workflow ComfyUI — dán ít nhất một workflow (API format)")
+		}
+		for _, w := range []string{p.Workflow, p.WorkflowNoRef} {
+			if err := llm.CheckComfyWorkflow(w); err != nil {
+				return p, err
+			}
+		}
+		if llm.ComfyRefSlots(p.Workflow) == 0 && p.Workflow != "" {
+			return p, errors.New("workflow “có ảnh tham chiếu” chưa có chỗ trống {ref1} nào — đặt {ref1}, {ref2}… vào ô image của các node LoadImage, hoặc dán nó vào ô “không ảnh tham chiếu”")
+		}
+	}
 	if err := a.st.SaveProvider(&p); err != nil {
 		return p, err
 	}
@@ -264,7 +301,7 @@ func (a *App) SaveProvider(in ProviderInput) (store.Provider, error) {
 	}
 	log.Printf("provider: lưu %q (%s · %s)", p.Name, p.Kind, p.Model)
 	// First provider becomes the default chat provider.
-	if a.st.Setting("provider.chat") == "" {
+	if a.st.Setting("provider.chat") == "" && !drawOnly {
 		a.st.SetSetting("provider.chat", p.ID)
 	}
 	return p, nil
@@ -278,7 +315,8 @@ func (a *App) DeleteProvider(id string) error {
 
 func (a *App) configFor(p store.Provider, key string) llm.Config {
 	return llm.Config{Kind: llm.Kind(p.Kind), BaseURL: p.BaseURL, Model: p.Model, APIKey: key,
-		Vision: p.Vision, Temperature: p.Temperature, Effort: p.Effort, NoThinking: p.Thinking == "off", ContextWindow: p.ContextWindow}
+		Vision: p.Vision, Temperature: p.Temperature, Effort: p.Effort, NoThinking: p.Thinking == "off", ContextWindow: p.ContextWindow, ImageAPI: p.ImageAPI,
+		Workflow: p.Workflow, WorkflowNoRef: p.WorkflowNoRef}
 }
 
 // contextWindow is the context length prompts for p are sized to: the one
@@ -340,6 +378,9 @@ func (a *App) resolve(role, id string) (llm.Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("provider cho '%s' không tồn tại", role)
 	}
+	if p.Purpose == store.PurposeImage {
+		return nil, fmt.Errorf("“%s” là provider tạo ảnh, không dùng được cho %s — chọn một model ngôn ngữ", p.Name, role)
+	}
 	return a.provider(p, role)
 }
 
@@ -359,6 +400,55 @@ func (a *App) provider(p store.Provider, role string) (llm.Provider, error) {
 		return nil, err
 	}
 	return llm.Logged(prov, p.Name, p.Model, role, func(c llm.Call) { a.logs.Model(c, a.setting("log.model")) }), nil
+}
+
+// markImageProvider makes the provider picked for illustrations (before
+// providers had a purpose) an image provider, unless a language role uses it.
+func markImageProvider(st *store.Store) {
+	id := st.Setting("provider.image")
+	if id == "" {
+		return
+	}
+	for _, role := range []string{"chat", "summarize", "vision"} {
+		if st.Setting("provider."+role) == id {
+			return
+		}
+	}
+	if p, err := st.Provider(id); err == nil && p.Purpose == "" {
+		p.Purpose = store.PurposeImage
+		st.SaveProvider(&p)
+	}
+}
+
+// imager is the client of the provider set for illustrations.
+func (a *App) imager() (llm.Imager, error) {
+	id := a.st.Setting("provider.image")
+	if id == "" {
+		return nil, errors.New("chưa chọn provider ảnh — vào Cài đặt › Tạo ảnh minh hoạ")
+	}
+	p, err := a.st.Provider(id)
+	if err != nil {
+		return nil, errors.New("provider tạo ảnh không còn tồn tại")
+	}
+	if p.Purpose != store.PurposeImage {
+		return nil, fmt.Errorf("“%s” là model ngôn ngữ, không vẽ được — chọn một provider tạo ảnh", p.Name)
+	}
+	return a.loggedImager(p)
+}
+
+// loggedImager builds p's drawing client; every drawing goes to the model log.
+func (a *App) loggedImager(p store.Provider) (llm.Imager, error) {
+	key, err := secrets.Get(p.ID)
+	if err != nil {
+		return nil, err
+	}
+	cfg := a.configFor(p, key)
+	im, err := llm.NewImager(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return llm.LoggedImager(im, p.Name, p.Model, llm.ImageAPIFor(cfg.Kind, cfg.ImageAPI),
+		func(c llm.ImageCall) { a.logs.Image(c, a.setting("log.model")) }), nil
 }
 
 // space returns the embedding space of a knowledge base: the local model
@@ -420,6 +510,9 @@ func (a *App) TestProvider(id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if p.Purpose == store.PurposeImage {
+		return "", errors.New("đây là provider tạo ảnh — dùng nút “Vẽ thử”")
+	}
 	prov, err := a.provider(p, "test")
 	if err != nil {
 		return "", err
@@ -428,6 +521,40 @@ func (a *App) TestProvider(id string) (string, error) {
 	defer cancel()
 	return llm.Complete(ctx, prov, llm.Request{Purpose: "thử provider", MaxTokens: 2000,
 		Messages: []llm.Message{llm.TextMessage(llm.RoleUser, "Say hello in one short sentence.")}})
+}
+
+// TestImageProvider draws a small test picture with an image provider and
+// returns it as a data URI.
+func (a *App) TestImageProvider(id string) (string, error) {
+	p, err := a.st.Provider(id)
+	if err != nil {
+		return "", err
+	}
+	im, err := a.loggedImager(p)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	start := time.Now()
+	img, err := im.Draw(ctx, llm.ImageRequest{Purpose: "vẽ thử provider", Aspect: "square",
+		Prompt: "A cozy tea house at dusk, warm lanterns, a cat sleeping on the counter, detailed illustration"})
+	if err != nil {
+		return "", act(err, "provider: vẽ thử %s", p.Name)
+	}
+	log.Printf("provider: vẽ thử %s xong sau %s", p.Name, time.Since(start).Round(time.Second))
+	return "data:" + img.MIME + ";base64," + img.B64, nil
+}
+
+// ListImageModels lists the checkpoints/models an image provider offers.
+func (a *App) ListImageModels(in ProviderInput) ([]string, error) {
+	key := in.APIKey
+	if key == "" && in.ID != "" {
+		key, _ = secrets.Get(in.ID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return llm.ImageModels(ctx, a.configFor(in.Provider, key))
 }
 
 // ---- knowledge bases ----
@@ -695,6 +822,28 @@ func (a *App) BranchChat(chatID string, msgID int64) (store.Chat, error) {
 	c, err := a.chat.Branch(chatID, msgID)
 	return c, act(err, "chat: %s rẽ nhánh tại tin nhắn %d → %s", chatID, msgID, c.ID)
 }
+
+// IllustrateMessage draws the moment of a message (the player's or a reply)
+// and adds the picture to it.
+func (a *App) IllustrateMessage(chatID string, msgID int64) error {
+	return act(a.chat.Illustrate(chatID, msgID), "chat: %s minh hoạ tin nhắn %d", chatID, msgID)
+}
+
+// ChatImage returns an illustration of a chat as a data URI.
+func (a *App) ChatImage(rel string) (string, error) {
+	p, err := a.chat.ImagePath(rel)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return "", fmt.Errorf("không đọc được ảnh: %w", err)
+	}
+	return "data:" + http.DetectContentType(data) + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+// ImagesAvailable says whether an image provider is set (the Tạo ảnh button works).
+func (a *App) ImagesAvailable() bool { return a.st.Setting("provider.image") != "" }
 
 func (a *App) Regenerate(chatID string) error {
 	return act(a.chat.Regenerate(chatID), "chat: %s tạo lại câu trả lời", chatID)

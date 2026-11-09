@@ -293,3 +293,29 @@ dialog::backdrop { background: rgba(0, 0, 0, .65); }
 
 /* chat drawer: the divergence log */
 .d-sec .divergence { white-space: pre-wrap; max-height: 320px; overflow-y: auto; }
+
+/* illustrations */
+.scene-img { margin: 10px 0; max-width: min(560px, 100%); }
+.scene-img img { display: block; width: 100%; border-radius: 12px; border: 1px solid var(--line); cursor: zoom-in; }
+.scene-img .img-wait { display: grid; place-items: center; aspect-ratio: 3 / 2; border-radius: 12px; border: 1px dashed var(--line);
+  color: var(--faint); background: var(--surface); font-size: 13px; }
+.scene-figure { display: flex; flex-direction: column; align-items: center; margin: 8px 0; }
+.scene-figure .scene-img { width: 100%; }
+.scene-figure .tools { display: flex; gap: 2px; opacity: 0; transition: opacity .12s; }
+.scene-figure:hover .tools, .scene-figure .tools.always { opacity: 1; }
+.scene-figure .tools button { padding: 3px 9px; font-size: 12px; background: transparent; color: var(--faint); }
+.scene-figure.rise { animation: msg-in .35s ease-out both; }
+.drawing { margin: 6px 0; font-size: 13px; }
+.img-full { display: block; max-width: 100%; max-height: 75vh; margin: 0 auto 8px; border-radius: 10px; }
+.comfy textarea { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.comfy code { font-size: 11.5px; }
+.flow { margin: 4px 0 12px; padding-left: 20px; display: grid; gap: 4px; }
+.settings h3 { margin: 16px 0 2px; font-size: 14px; }
+#draw-scene { font-size: 16px; line-height: 1; }
+#draw-scene.dim { opacity: .4; }
+.settings .actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+.draw-error { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; margin: 6px 0; padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, #e5534b 45%, transparent); border-radius: 10px; background: color-mix(in srgb, #e5534b 10%, transparent);
+  font-size: 13px; white-space: pre-wrap; word-break: break-word; max-width: 760px; }
+.draw-error-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.draw-error-actions button { padding: 2px 8px; font-size: 12px; }

@@ -24,9 +24,35 @@ const ICON = {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+const IMAGE_LINE = /^\[Image: ([^|\]\n]+?)(?: \| ([^\]\n]*))?\]$/;
 function formatMsg(s) {
-  return esc(s).replace(/\*([^*\n]+)\*/g, "<em>*$1*</em>");
+  return s.split("\n").map(line => {
+    const m = line.trim().match(IMAGE_LINE);
+    if (m) return figureHTML(m[1], m[2]);
+    return esc(line).replace(/\*([^*\n]+)\*/g, "<em>*$1*</em>");
+  }).join("\n").replace(/<\/figure>\n/g, "</figure>");
 }
+// figureHTML is a placeholder for an illustration; loadFigures fills it in.
+function figureHTML(src, caption = "") {
+  return `<figure class="scene-img" data-src="${esc(src)}" title="${esc(caption)}"><div class="img-wait">🖼</div></figure>`;
+}
+const imageCache = new Map();
+async function loadFigures(root = document) {
+  for (const fig of root.querySelectorAll("figure.scene-img:not([data-loaded])")) {
+    fig.dataset.loaded = "1";
+    const src = fig.dataset.src;
+    if (!imageCache.has(src)) imageCache.set(src, api.ChatImage(src).catch(() => null));
+    const uri = await imageCache.get(src);
+    if (!uri) { fig.innerHTML = `<div class="img-wait">⚠ Không tìm thấy ảnh</div>`; continue; }
+    const img = new Image();
+    img.src = uri;
+    img.alt = fig.title;
+    img.onclick = () => openModal(`<img src="${uri}" class="img-full" alt=""><p class="muted small">${esc(fig.title)}</p>
+      <div class="modal-actions"><button value="cancel" class="primary">Đóng</button></div>`, () => {});
+    fig.replaceChildren(img);
+  }
+}
+new MutationObserver(() => loadFigures($("#messages"))).observe($("#messages"), { childList: true, subtree: true });
 function toast(msg, isErr = false) {
   const t = $("#toast");
   t.textContent = msg;
@@ -69,7 +95,15 @@ function kbPicker(selected = []) {
 
 // ---------- providers ----------
 async function loadProviders() {
-  [state.providers, state.settings] = await Promise.all([api.ListProviders(), api.GetSettings()]);
+  let all;
+  [all, state.settings] = await Promise.all([api.ListProviders(), api.GetSettings()]);
+  splitProviders(all);
+}
+// state.providers holds the language models (every model picker lists
+// them); state.imageProviders the models that draw.
+function splitProviders(all) {
+  state.providers = all.filter(p => p.purpose !== "image");
+  state.imageProviders = all.filter(p => p.purpose === "image");
 }
 function providerById(id) { return state.providers.find(p => p.id === id); }
 // The provider a role falls back to when nothing specific is picked (mirrors App.resolve).
@@ -663,11 +697,12 @@ const KINDS = {
 const BASE_URLS = { openai: "https://api.openai.com/v1", openrouter: "https://openrouter.ai/api/v1", nvidia: "https://integrate.api.nvidia.com/v1", local: "http://localhost:11434/v1", anthropic: "" };
 
 async function loadSettings() {
-  const [settings, providers, ws] = await Promise.all([api.GetSettings(), api.ListProviders(), api.GetWorkerStatus()]);
-  state.providers = providers;
+  const [settings, all, ws] = await Promise.all([api.GetSettings(), api.ListProviders(), api.GetWorkerStatus()]);
+  splitProviders(all);
   state.settings = settings;
+  const providers = state.providers, images = state.imageProviders;
   const list = $("#provider-list");
-  list.innerHTML = providers.length ? "" : `<p class="muted">Thêm ít nhất một provider để bắt đầu.</p>`;
+  list.innerHTML = providers.length ? "" : `<p class="muted">Thêm ít nhất một model ngôn ngữ để bắt đầu.</p>`;
   for (const p of providers) {
     const row = document.createElement("div");
     row.className = "provider-row";
@@ -682,14 +717,42 @@ async function loadSettings() {
     };
     list.append(row);
   }
+  const ilist = $("#image-provider-list");
+  ilist.innerHTML = images.length ? "" : `<p class="muted small">Chưa có provider ảnh nào — bấm “+ Thêm provider ảnh” (ComfyUI, SD WebUI, OpenAI Images, OpenRouter…).</p>`;
+  for (const p of images) {
+    const row = document.createElement("div");
+    row.className = "provider-row";
+    const t = IMAGE_TYPES[imageType(p)];
+    row.innerHTML = `<div class="grow"><div>${esc(p.name)}</div><div class="muted small">${esc(t.label)}${p.model ? " · " + esc(p.model) : ""} · ${t.refs ? "nhận ảnh tham chiếu" : "không nhận ảnh tham chiếu"}${p.hasKey ? " · 🔑" : ""}</div></div>
+      <button data-a="test">Vẽ thử</button><button data-a="edit">Sửa</button>`;
+    row.onclick = async e => {
+      if (e.target.dataset.a === "edit") editImageProvider(p);
+      if (e.target.dataset.a === "test") {
+        e.target.disabled = true;
+        const old = e.target.textContent;
+        e.target.textContent = "Đang vẽ…";
+        try {
+          const uri = await guard(() => api.TestImageProvider(p.id));
+          openModal(`<h2>Vẽ thử: ${esc(p.name)}</h2><img src="${uri}" class="img-full" alt="">
+            <div class="modal-actions"><button value="cancel" class="primary">Đóng</button></div>`, () => {});
+        } finally { e.target.disabled = false; e.target.textContent = old; }
+      }
+    };
+    ilist.append(row);
+  }
   for (const sel of $$(".provider-select")) {
     sel.innerHTML = (sel.dataset.empty ? `<option value="">— Giống model chat —</option>` : "") +
       providers.map(p => `<option value="${p.id}">${esc(providerLabel(p))}</option>`).join("");
+  }
+  for (const sel of $$(".image-provider-select")) {
+    sel.innerHTML = `<option value="">— Chưa chọn (không tạo ảnh) —</option>` +
+      images.map(p => `<option value="${p.id}">${esc(p.name)} · ${esc(IMAGE_TYPES[imageType(p)].label)}</option>`).join("");
   }
   for (const el of $$("[data-setting]")) {
     const v = settings[el.dataset.setting] ?? "";
     if (el.type === "checkbox") el.checked = v === "true"; else el.value = v;
   }
+  $("#draw-scene").classList.toggle("dim", !settings["provider.image"]);
   $("#worker-status").textContent = ws.dir
     ? `Worker: ${ws.running ? "đang chạy" : "đang tắt (sẽ bật khi cần)"} · ${ws.python}`
     : "⚠ Không tìm thấy thư mục worker/ — xem README để cài đặt.";
@@ -700,17 +763,29 @@ async function loadSettings() {
 $("#open-logs").onclick = () => guard(() => api.OpenLogDir());
 $("#open-prompts").onclick = () => guard(() => api.OpenPromptsDir());
 
+// Every setting saves itself as soon as it changes (a text box when you leave it).
+for (const el of $$("[data-setting]")) el.addEventListener("change", () => saveSetting(el));
+async function saveSetting(el) {
+  const key = el.dataset.setting;
+  const value = el.type === "checkbox" ? String(el.checked) : el.value;
+  await guard(() => api.SaveSettings({ [key]: value }));
+  state.settings = { ...state.settings, [key]: value };
+  toast("✓ Đã lưu");
+  if (key === "provider.image") syncDrawButton();
+}
+
 $("#save-settings").onclick = async () => {
   const values = {};
   for (const el of $$("[data-setting]")) values[el.dataset.setting] = el.type === "checkbox" ? String(el.checked) : el.value;
   await guard(() => api.SaveSettings(values));
   state.settings = await api.GetSettings();
+  syncDrawButton();
   toast("Đã lưu cài đặt");
 };
 
 function editProvider(p = { kind: "anthropic", temperature: 0, vision: false }) {
   const body = openModal(`
-    <h2>${p.id ? "Sửa" : "Thêm"} provider</h2>
+    <h2>${p.id ? "Sửa" : "Thêm"} model ngôn ngữ</h2>
     <label>Loại<select name="kind">${Object.entries(KINDS).map(([k, v]) => `<option value="${k}" ${k === p.kind ? "selected" : ""}>${v.label}</option>`).join("")}</select></label>
     <label>Tên hiển thị<input name="name" value="${esc(p.name)}" placeholder="Vd: Claude chính, GPT rẻ cho tóm tắt…"></label>
     <label>Base URL<input name="baseUrl" value="${esc(p.baseUrl)}"></label>
@@ -739,7 +814,7 @@ function editProvider(p = { kind: "anthropic", temperature: 0, vision: false }) 
     id: p.id || "", name: fd.get("name") || KINDS[fd.get("kind")].label, kind: fd.get("kind"), baseUrl: fd.get("baseUrl"),
     model: fd.get("model"), apiKey: fd.get("apiKey"), temperature: parseFloat(fd.get("temperature")) || 0,
     effort: fd.get("effort"), vision: fd.get("vision") === "on", thinking: fd.get("thinking") === "on" ? "off" : "",
-    contextWindow: parseInt(fd.get("contextWindow")) || 0,
+    contextWindow: parseInt(fd.get("contextWindow")) || 0, purpose: "",
   });
   const kindSel = $("[name=kind]", body);
   const sync = first => {
@@ -767,6 +842,116 @@ function editProvider(p = { kind: "anthropic", temperature: 0, vision: false }) 
   };
 }
 $("#new-provider").onclick = () => editProvider();
+$("#new-image-provider").onclick = () => editImageProvider();
+
+// Ways to draw. kind/api are what the backend stores (Provider.kind, imageApi).
+const IMAGE_TYPES = {
+  comfyui: { label: "ComfyUI (máy bạn)", kind: "local", api: "comfyui", url: "http://127.0.0.1:8188", key: false, refs: true,
+    model: "Checkpoint (điền vào {model} trong workflow)", note: "Chạy workflow của bạn: model nào, cách giữ mặt nào cũng được. Ảnh tham chiếu vào các node LoadImage có {ref1}, {ref2}…" },
+  sdwebui: { label: "Stable Diffusion WebUI / Forge (máy bạn)", kind: "local", api: "sdwebui", url: "http://127.0.0.1:7860", key: false, refs: false,
+    model: "Checkpoint (để trống = cái đang nạp)", note: "Chỉ vẽ theo prompt; khi cảnh nối tiếp thì vẽ đè lên ảnh trước. Không giữ được mặt nhân vật." },
+  openai: { label: "OpenAI Images / API tương thích", kind: "openai", api: "images", url: "https://api.openai.com/v1", key: true, refs: true,
+    model: "Model", def: "gpt-image-1", note: "gpt-image-1 nhận nhiều ảnh tham chiếu (/images/edits); dall-e chỉ vẽ theo prompt." },
+  openrouter: { label: "OpenRouter (model trả về ảnh)", kind: "openrouter", api: "chat", url: "https://openrouter.ai/api/v1", key: true, refs: true,
+    model: "Model", note: "Model chat có đầu ra ảnh, ví dụ Gemini image — nhận nhiều ảnh tham chiếu, mỗi ảnh kèm chú thích là ai." },
+  chat: { label: "API khác kiểu OpenAI (model trả về ảnh)", kind: "openai", api: "chat", url: "", key: true, refs: true,
+    model: "Model", note: "Endpoint /chat/completions có đầu ra ảnh (định dạng như OpenRouter)." },
+};
+function imageType(p) {
+  if (p.imageApi === "comfyui" || p.imageApi === "sdwebui") return p.imageApi;
+  if (p.imageApi === "images") return "openai";
+  if (p.imageApi === "chat") return p.kind === "openrouter" ? "openrouter" : "chat";
+  return { openai: "openai", openrouter: "openrouter", local: "sdwebui" }[p.kind] || "chat";
+}
+
+function editImageProvider(p = { imageApi: "comfyui", kind: "local" }) {
+  const cur = imageType(p);
+  const body = openModal(`
+    <h2>${p.id ? "Sửa" : "Thêm"} provider ảnh</h2>
+    <p class="muted small">Provider ảnh chỉ vẽ. Prompt và ảnh tham chiếu do model chat viết và chọn, rồi gửi sang đây.</p>
+    <label>Cách vẽ<select name="type">${Object.entries(IMAGE_TYPES).map(([k, t]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${t.label}</option>`).join("")}</select></label>
+    <p class="muted small type-note"></p>
+    <label>Tên hiển thị<input name="name" value="${esc(p.name)}" placeholder="Vd: ComfyUI máy nhà"></label>
+    <label>Địa chỉ (Base URL)<input name="baseUrl" value="${esc(p.baseUrl)}"></label>
+    <label class="key">API key ${p.hasKey ? "<small>(đã lưu trong Windows Credential Manager — để trống để giữ nguyên)</small>" : ""}<input name="apiKey" type="password" autocomplete="off"></label>
+    <label><span class="model-label">Model</span><div class="gen-row"><input name="model" list="image-model-list" value="${esc(p.model)}"><button type="button" id="load-image-models">Tải danh sách</button></div></label>
+    <datalist id="image-model-list"></datalist>
+    <div class="comfy" hidden>
+      <p class="muted small">Trong ComfyUI: dựng workflow → menu Workflow › <b>Export (API)</b> → dán file JSON vào đây (hoặc “Chọn file JSON…”). Đặt chỗ trống vào các ô của node:
+        <code>{prompt}</code> (bắt buộc, ô text của CLIPTextEncode dương), <code>{negative}</code>, <code>{width}</code>, <code>{height}</code>, <code>{seed}</code>, <code>{model}</code> (= ô Checkpoint ở trên),
+        <code>{ref1}</code>, <code>{ref2}</code>… (ô image của node LoadImage: ảnh tham chiếu theo thứ tự ảnh trước → nhân vật → trang truyện), <code>{ref_labels}</code> (mô tả ảnh nào là ai, cho model edit).</p>
+      <label>Workflow có ảnh tham chiếu <small>(IP-Adapter, PuLID, Qwen-Image-Edit, Flux Kontext… — dùng khi cảnh có ảnh nhân vật)</small>
+        <textarea name="workflow" rows="4" spellcheck="false" placeholder='{"3": {"class_type": "KSampler", ...}}'>${esc(p.workflow || "")}</textarea></label>
+      <div class="gen-row"><button type="button" data-load="workflow">Chọn file JSON…</button></div>
+      <label>Workflow không ảnh tham chiếu <small>(txt2img — dùng khi cảnh không có ảnh nào, hoặc khi bạn chỉ có workflow này)</small>
+        <textarea name="workflowNoRef" rows="4" spellcheck="false">${esc(p.workflowNoRef || "")}</textarea></label>
+      <div class="gen-row"><button type="button" data-load="workflowNoRef">Chọn file JSON…</button><button type="button" id="comfy-sample">Dán mẫu SDXL cơ bản</button></div>
+      <input type="file" accept=".json,application/json" id="comfy-file" hidden>
+    </div>
+    <div class="modal-actions">
+      ${p.id ? `<button value="delete" class="danger ghost" style="margin-right:auto">Xoá</button>` : ""}
+      <button value="cancel">Huỷ</button><button value="save" class="primary">Lưu</button>
+    </div>`,
+    async (fd, action) => {
+      if (action === "delete") await api.DeleteProvider(p.id);
+      else await api.SaveProvider(collect(fd));
+      loadSettings();
+    });
+
+  const collect = fd => {
+    const t = IMAGE_TYPES[fd.get("type")];
+    const comfy = t.api === "comfyui";
+    return {
+      id: p.id || "", purpose: "image", name: fd.get("name") || t.label, kind: t.kind, imageApi: t.api,
+      baseUrl: fd.get("baseUrl"), model: fd.get("model") || "", apiKey: t.key ? fd.get("apiKey") : "",
+      workflow: comfy ? (fd.get("workflow") || "").trim() : "", workflowNoRef: comfy ? (fd.get("workflowNoRef") || "").trim() : "",
+    };
+  };
+  const typeSel = $("[name=type]", body);
+  const sync = first => {
+    const t = IMAGE_TYPES[typeSel.value];
+    $(".type-note", body).textContent = t.note;
+    $(".key", body).hidden = !t.key;
+    $(".comfy", body).hidden = t.api !== "comfyui";
+    $(".model-label", body).textContent = t.model;
+    if (!first || !p.id) {
+      $("[name=baseUrl]", body).value = t.url;
+      if (!first || !$("[name=model]", body).value) $("[name=model]", body).value = t.def || "";
+    }
+  };
+  typeSel.onchange = () => sync(false);
+  sync(true);
+  $("#load-image-models", body).onclick = async () => {
+    const models = await guard(() => api.ListImageModels(collect(new FormData(body))));
+    $("#image-model-list", body).innerHTML = models.map(m => `<option value="${esc(m)}">`).join("");
+    toast(`${models.length} model — gõ để lọc`);
+  };
+  let loadInto = null;
+  const fileIn = $("#comfy-file", body);
+  $$("[data-load]", body).forEach(b => (b.onclick = () => { loadInto = b.dataset.load; fileIn.value = ""; fileIn.click(); }));
+  fileIn.onchange = async () => {
+    const f = fileIn.files[0];
+    if (!f || !loadInto) return;
+    const text = await f.text();
+    try { JSON.parse(text); } catch { return toast("File không phải JSON", true); }
+    $(`[name=${loadInto}]`, body).value = text;
+  };
+  $("#comfy-sample", body).onclick = () => {
+    $("[name=workflowNoRef]", body).value = JSON.stringify(COMFY_SDXL, null, 1);
+    toast("Đã dán mẫu — chọn checkpoint ở ô trên (bấm “Tải danh sách”)");
+  };
+}
+
+// A basic SDXL text-to-image workflow in ComfyUI's API format, with the app's placeholders.
+const COMFY_SDXL = {
+  "3": { class_type: "KSampler", inputs: { seed: "{seed}", steps: 28, cfg: 6, sampler_name: "euler", scheduler: "normal", denoise: 1, model: ["4", 0], positive: ["6", 0], negative: ["7", 0], latent_image: ["5", 0] } },
+  "4": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "{model}" } },
+  "5": { class_type: "EmptyLatentImage", inputs: { width: "{width}", height: "{height}", batch_size: 1 } },
+  "6": { class_type: "CLIPTextEncode", inputs: { text: "{prompt}", clip: ["4", 1] } },
+  "7": { class_type: "CLIPTextEncode", inputs: { text: "{negative}", clip: ["4", 1] } },
+  "8": { class_type: "VAEDecode", inputs: { samples: ["3", 0], vae: ["4", 2] } },
+  "9": { class_type: "SaveImage", inputs: { filename_prefix: "immersive", images: ["8", 0] } },
+};
 
 // ---------- chats ----------
 // chatSubject describes who the player talks to: a character card, or in
@@ -942,6 +1127,7 @@ function introEl() {
 const NARRATOR_TAG = /^(narrator|narration|người dẫn truyện|dẫn truyện|người kể chuyện)$/i;
 const TIMELINE_TAG = /^(timeline|time|mốc thời gian|thời gian|dòng thời gian)$/i;
 const TIMELINE = "\u0000timeline"; // speaker of a [Timeline] block
+const PICTURE = "\u0000picture"; // an illustration
 function splitScene(text, streaming = false) {
   const lines = text.split("\n");
   if (streaming && /^\s*\[[^\]\n]*$/.test(lines.at(-1))) lines.pop(); // half-written tag
@@ -951,10 +1137,17 @@ function splitScene(text, streaming = false) {
     cur.text = cur.text.trim();
     if (!cur.text) return;
     const prev = blocks.at(-1);
-    if (prev && prev.speaker === cur.speaker) prev.text += "\n\n" + cur.text;
+    if (prev && prev.speaker === cur.speaker && cur.speaker !== PICTURE) prev.text += "\n\n" + cur.text;
     else blocks.push(cur);
   };
   for (const line of lines) {
+    if (IMAGE_LINE.test(line.trim())) {
+      flush();
+      const speaker = cur.speaker;
+      blocks.push({ speaker: PICTURE, text: line.trim() });
+      cur = { speaker, text: "" };
+      continue;
+    }
     const m = line.match(/^\s*\*{0,2}\[([^\[\]\n]{1,40})\]\*{0,2}\s*:?\s*(.*)$/);
     if (m) {
       flush();
@@ -997,7 +1190,10 @@ function fillSceneTurn(turn, text, streaming, extra = "") {
     const el = document.createElement("div");
     const last = i === blocks.length - 1;
     const body = `<div class="body${streaming && last ? " typing" : ""}">${formatMsg(b.text)}</div>`;
-    if (b.speaker === TIMELINE) {
+    if (b.speaker === PICTURE) {
+      el.className = "scene-figure";
+      el.innerHTML = formatMsg(b.text) + (last ? extra : "");
+    } else if (b.speaker === TIMELINE) {
       el.className = "timeline-mark";
       el.innerHTML = `<span>⏱ ${esc(b.text.replace(/\s*\n\s*/g, " · "))}</span>${last ? extra : ""}`;
     } else if (b.speaker) {
@@ -1019,7 +1215,8 @@ function msgEl(m, canRegen = false) {
   const isUser = m.role === "user";
   const tools = `<div class="tools ${canRegen ? "always" : ""}">${canRegen ? `<button data-a="regen" title="Tạo lại">↻ Tạo lại</button>` : ""}<button data-a="edit">Sửa</button><button data-a="del">Xoá</button>`
     + `<button data-a="rollback" title="Xoá mọi tin nhắn sau tin này và chat tiếp từ đây">↩ Quay lại đây</button>`
-    + `<button data-a="branch" title="Mở một cuộc trò chuyện mới tiếp nối từ tin này, giữ nguyên cuộc hiện tại">⑂ Rẽ nhánh</button></div>`;
+    + `<button data-a="branch" title="Mở một cuộc trò chuyện mới tiếp nối từ tin này, giữ nguyên cuộc hiện tại">⑂ Rẽ nhánh</button>`
+    + (state.settings?.["provider.image"] ? `<button data-a="draw" title="Vẽ phân cảnh của tin nhắn này: model chat viết prompt, app gắn ảnh tham chiếu nhân vật, provider ảnh vẽ">🖼 Tạo ảnh</button>` : "") + `</div>`;
   let el;
   if (!isUser && state.chat?.mode === "scene") {
     el = sceneTurnEl(m.content, { extra: tools });
@@ -1037,6 +1234,7 @@ function msgEl(m, canRegen = false) {
     if (a === "regen") regenerate();
     if (a === "rollback") rollbackDialog(chat, m.id);
     if (a === "branch") branchFrom(chat, m.id);
+    if (a === "draw") drawMessage(chat, m.id);
     if (a === "del") { await guard(() => api.DeleteMessage(m.id)); el.remove(); }
     if (a === "edit") {
       openModal(`<h2>Sửa tin nhắn</h2><textarea name="c" rows="8">${esc(m.content)}</textarea>
@@ -1044,7 +1242,66 @@ function msgEl(m, canRegen = false) {
         async fd => { await api.EditMessage(m.id, fd.get("c")); if (state.chatId === chat) renderMessages(); });
     }
   };
+  el.dataset.msgId = m.id;
+  if (drawingMsgs[m.id]) el.querySelector(".tools")?.insertAdjacentHTML("beforebegin", drawingHTML(m.id));
+  if (drawErrors[m.id]) el.querySelector(".tools")?.insertAdjacentHTML("beforebegin", drawErrorHTML(m.id));
   return el;
+}
+
+// Pictures being drawn from the Tạo ảnh button: message id → progress text,
+// shown under the message (kept across re-renders).
+const drawingMsgs = {};
+const DRAW_STAGE = {
+  writing: "🖼 Model đang đọc phân cảnh, tra truyện và viết prompt…",
+  drawing: "🖼 Đang vẽ (đã gắn ảnh tham chiếu nhân vật)…",
+};
+// Why a drawing failed, kept under its message until dismissed.
+const drawErrors = {};
+function drawErrorHTML(id) {
+  return `<div class="draw-error" data-draw-err="${id}"><span>⚠ Không tạo được ảnh: ${esc(drawErrors[id])}</span>
+    <span class="draw-error-actions"><button type="button" data-a="log">Mở model log</button><button type="button" data-a="x" title="Ẩn">✕</button></span></div>`;
+}
+function setDrawError(id, error) {
+  if (error) drawErrors[id] = error; else delete drawErrors[id];
+  $(`[data-draw-err="${id}"]`)?.remove();
+  if (error) $(`[data-msg-id="${id}"] .tools`)?.insertAdjacentHTML("beforebegin", drawErrorHTML(id));
+}
+document.addEventListener("click", e => {
+  const box = e.target.closest?.(".draw-error");
+  if (!box) return;
+  if (e.target.dataset.a === "log") guard(() => api.OpenLogDir());
+  if (e.target.dataset.a === "x") setDrawError(box.dataset.drawErr, null);
+});
+
+async function drawMessage(chatId, id) {
+  if (!state.settings?.["provider.image"]) return toast("Chưa chọn provider ảnh — vào Cài đặt › Tạo ảnh minh hoạ › “Provider ảnh đang dùng”", true);
+  if (drawingMsgs[id]) return toast("Tin nhắn này đang được vẽ");
+  setDrawError(id, null);
+  await guard(() => api.IllustrateMessage(chatId, id));
+  setDrawing(id, DRAW_STAGE.writing);
+}
+// The composer's 🖼 draws the newest message of the chat.
+$("#draw-scene").onclick = () => {
+  const last = $$("#messages [data-msg-id]").at(-1);
+  if (!last) return toast("Chưa có tin nhắn nào để vẽ", true);
+  drawMessage(state.chatId, Number(last.dataset.msgId));
+};
+function syncDrawButton() {
+  const on = !!state.settings?.["provider.image"];
+  const b = $("#draw-scene");
+  b.classList.toggle("dim", !on);
+  b.title = on ? "Tạo ảnh phân cảnh hiện tại (tin nhắn mới nhất). Muốn vẽ tin khác: rê chuột vào tin đó › 🖼 Tạo ảnh"
+    : "Chưa chọn provider ảnh — vào Cài đặt › Tạo ảnh minh hoạ";
+  if (state.view === "chat" && state.chatId) renderMessages();
+}
+function drawingHTML(id) { return `<div class="drawing thinking" data-draw-msg="${id}">${esc(drawingMsgs[id])}</div>`; }
+function setDrawing(id, text) {
+  if (text) drawingMsgs[id] = text; else delete drawingMsgs[id];
+  const old = $(`[data-draw-msg="${id}"]`);
+  if (!text) return old?.remove();
+  if (old) return (old.textContent = text);
+  const tools = $(`[data-msg-id="${id}"] .tools`);
+  tools?.insertAdjacentHTML("beforebegin", drawingHTML(id));
 }
 
 // rollbackDialog returns the chat to message msgId, or branches from it instead.
@@ -1098,6 +1355,7 @@ on("chat:start", ({ chatId }) => {
 on("chat:delta", ({ chatId, delta }) => {
   state.streaming[chatId] = (state.streaming[chatId] ?? "") + delta;
   if (chatId !== state.chatId) return;
+  $$(".streaming .drawing").forEach(d => d.remove());
   const turn = $(".scene-turn.streaming");
   const body = $(".msg.streaming .body");
   if (turn) fillSceneTurn(turn, state.streaming[chatId], true);
@@ -1121,6 +1379,29 @@ on("chat:lookup", ({ chatId, tool, args }) => {
   body.innerHTML = `<span class="thinking">Đang ${LOOKUP[tool] ?? "tra cứu"}${what ? ": " + esc(String(what)) : ""}…</span>`;
 });
 on("chat:divergence", ({ chatId, divergence }) => setDivergence(chatId, divergence));
+// An illustration is being drawn (during a reply, or from the Tạo ảnh button).
+on("chat:image", ({ chatId, status, error }) => {
+  if (chatId !== state.chatId) return;
+  if (status === "error") return toast("Không vẽ được ảnh: " + error, true);
+  if (status !== "drawing" || state.streaming[chatId] == null) return;
+  let body = $$(".streaming .body").at(-1);
+  if (!body || state.streaming[chatId]) {
+    $$(".streaming .drawing").forEach(d => d.remove());
+    $(".scene-turn.streaming, .msg.streaming .col")?.insertAdjacentHTML("beforeend", `<div class="drawing thinking">🖼 Đang vẽ minh hoạ…</div>`);
+  } else body.innerHTML = `<span class="thinking">🖼 Đang vẽ minh hoạ…</span>`;
+  scrollDown();
+});
+on("chat:illustrating", ({ msgId, stage }) => setDrawing(msgId, DRAW_STAGE[stage]));
+on("chat:illustrated", ({ chatId, msgId, refs }) => {
+  setDrawing(msgId, null);
+  if (chatId === state.chatId && state.streaming[chatId] == null) renderMessages();
+  toast(refs?.length ? "Đã vẽ xong — ảnh tham chiếu: " + refs.join("; ") : "Đã vẽ xong (không tìm được ảnh tham chiếu nào, vẽ theo mô tả)");
+});
+on("chat:illustrate-error", ({ msgId, error }) => {
+  setDrawing(msgId, null);
+  setDrawError(msgId, error);
+  toast("Không tạo được ảnh — xem lý do dưới tin nhắn", true);
+});
 on("chat:done", ({ chatId }) => {
   delete state.streaming[chatId];
   if (chatId === state.chatId) { setStreaming(false); renderMessages(); }

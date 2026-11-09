@@ -306,21 +306,7 @@ func looseInt(raw json.RawMessage) int {
 // ReadChapter returns chapter n's text from fromPage on (0 = its start), cut
 // at maxChars with a note on where to continue.
 func (l *Lore) ReadChapter(kbIDs []string, work string, n, fromPage, maxChars int) string {
-	var ch *store.Chapter
-	var count int
-	for _, id := range kbIDs {
-		if work != "" {
-			if kb, err := l.St.KnowledgeBase(id); err != nil || !strings.EqualFold(strings.TrimSpace(kb.Name), strings.TrimSpace(work)) {
-				continue
-			}
-		}
-		chs, _ := l.St.Chapters(id)
-		count = max(count, len(chs))
-		if n <= len(chs) {
-			ch = &chs[n-1]
-			break
-		}
-	}
+	ch, _, count := l.chapter(kbIDs, work, n)
 	if ch == nil {
 		return fmt.Sprintf("There is no chapter %d (the map has %d chapters).", n, count)
 	}

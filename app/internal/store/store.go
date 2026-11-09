@@ -63,6 +63,12 @@ var migrations = []string{
 	`ALTER TABLE chats ADD COLUMN divergence TEXT DEFAULT ''`,
 	`ALTER TABLE chats ADD COLUMN divergence_upto INTEGER DEFAULT 0`,
 	`ALTER TABLE chapters ADD COLUMN time_mark TEXT DEFAULT ''`,
+	`ALTER TABLE providers ADD COLUMN image_api TEXT DEFAULT ''`,
+	`ALTER TABLE providers ADD COLUMN workflow TEXT DEFAULT ''`,
+	`ALTER TABLE providers ADD COLUMN workflow_noref TEXT DEFAULT ''`,
+	`ALTER TABLE providers ADD COLUMN purpose TEXT DEFAULT ''`,
+	// Drawing-only servers were image providers before providers had a purpose.
+	`UPDATE providers SET purpose='image' WHERE purpose='' AND image_api IN ('comfyui','sdwebui')`,
 }
 
 func Open(path string) (*Store, error) {
@@ -151,7 +157,7 @@ func (s *Store) SetSetting(key, value string) error {
 // ---- providers ----
 
 func (s *Store) Providers() ([]Provider, error) {
-	rows, err := s.db.Query(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window FROM providers ORDER BY name`)
+	rows, err := s.db.Query(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window,image_api,workflow,workflow_noref,purpose FROM providers ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +166,7 @@ func (s *Store) Providers() ([]Provider, error) {
 	for rows.Next() {
 		var p Provider
 		var vision int
-		if err := rows.Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking, &p.ContextWindow); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking, &p.ContextWindow, &p.ImageAPI, &p.Workflow, &p.WorkflowNoRef, &p.Purpose); err != nil {
 			return nil, err
 		}
 		p.Vision = vision == 1
@@ -172,8 +178,8 @@ func (s *Store) Providers() ([]Provider, error) {
 func (s *Store) Provider(id string) (Provider, error) {
 	var p Provider
 	var vision int
-	err := s.db.QueryRow(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window FROM providers WHERE id=?`, id).
-		Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking, &p.ContextWindow)
+	err := s.db.QueryRow(`SELECT id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window,image_api,workflow,workflow_noref,purpose FROM providers WHERE id=?`, id).
+		Scan(&p.ID, &p.Name, &p.Kind, &p.BaseURL, &p.Model, &vision, &p.Temperature, &p.Effort, &p.Thinking, &p.ContextWindow, &p.ImageAPI, &p.Workflow, &p.WorkflowNoRef, &p.Purpose)
 	p.Vision = vision == 1
 	return p, err
 }
@@ -182,10 +188,10 @@ func (s *Store) SaveProvider(p *Provider) error {
 	if p.ID == "" {
 		p.ID = NewID()
 	}
-	_, err := s.db.Exec(`INSERT INTO providers(id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window) VALUES(?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO providers(id,name,kind,base_url,model,vision,temperature,effort,thinking,context_window,image_api,workflow,workflow_noref,purpose) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind, base_url=excluded.base_url,
-		model=excluded.model, vision=excluded.vision, temperature=excluded.temperature, effort=excluded.effort, thinking=excluded.thinking, context_window=excluded.context_window`,
-		p.ID, p.Name, p.Kind, p.BaseURL, p.Model, b2i(p.Vision), p.Temperature, p.Effort, p.Thinking, p.ContextWindow)
+		model=excluded.model, vision=excluded.vision, temperature=excluded.temperature, effort=excluded.effort, thinking=excluded.thinking, context_window=excluded.context_window, image_api=excluded.image_api, workflow=excluded.workflow, workflow_noref=excluded.workflow_noref, purpose=excluded.purpose`,
+		p.ID, p.Name, p.Kind, p.BaseURL, p.Model, b2i(p.Vision), p.Temperature, p.Effort, p.Thinking, p.ContextWindow, p.ImageAPI, p.Workflow, p.WorkflowNoRef, p.Purpose)
 	return err
 }
 
@@ -605,6 +611,14 @@ func (s *Store) RollBack(chatID string, msgID int64) (int64, error) {
 	_, err = s.db.Exec(`UPDATE chats SET divergence=?, divergence_upto=? WHERE id=?`, text, upTo, chatID)
 	s.TouchChat(chatID)
 	return n, err
+}
+
+// MessagesContaining counts the messages outside chat exceptChat whose text
+// contains substr.
+func (s *Store) MessagesContaining(substr, exceptChat string) int {
+	var n int
+	s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE chat_id<>? AND instr(content, ?) > 0`, exceptChat, substr).Scan(&n)
+	return n
 }
 
 // MaxSummarizedID is the last message folded into long-term memory (0 = none).

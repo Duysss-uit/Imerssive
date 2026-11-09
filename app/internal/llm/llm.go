@@ -84,6 +84,11 @@ type Config struct {
 	// ContextWindow is the model's context length in tokens (0 = unknown);
 	// prompts are sized to fit it (see Budget).
 	ContextWindow int
+	// ImageAPI is how an image provider draws (see ImageAPIFor).
+	ImageAPI string
+	// ComfyUI workflows (API format with placeholders): one for drawings
+	// with reference pictures, one without; either may be empty.
+	Workflow, WorkflowNoRef string
 }
 
 // DefaultBaseURL returns the preset endpoint for a kind.

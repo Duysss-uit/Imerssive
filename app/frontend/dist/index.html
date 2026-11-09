@@ -87,15 +87,30 @@
       <header class="home-head"><h1>Cài đặt</h1></header>
       <div class="settings">
         <div class="card">
-          <div class="card-head"><h2>Provider</h2><button id="new-provider">+ Thêm</button></div>
+          <div class="card-head"><h2>💬 Model ngôn ngữ (LLM)</h2><button id="new-provider">+ Thêm model ngôn ngữ</button></div>
+          <p class="muted small">Model đọc truyện, nhập vai, tóm tắt, đọc trang truyện tranh — và là model <b>quyết định vẽ gì</b>: nó viết prompt cho ảnh và chọn ảnh tham chiếu (Claude, OpenAI, OpenRouter, NVIDIA, Ollama / LM Studio…).</p>
           <div id="provider-list"></div>
-        </div>
-        <div class="card">
-          <h2>Model mặc định</h2>
-          <p class="muted small">Dùng khi bạn không chọn model riêng lúc chat, tạo nhân vật hay xử lý bộ truyện.</p>
-          <label>Chat (nhập vai)<select data-setting="provider.chat" class="provider-select"></select></label>
+          <h3>Dùng cho</h3>
+          <p class="muted small">Mặc định khi bạn không chọn model riêng lúc chat, tạo nhân vật hay xử lý bộ truyện.</p>
+          <label>Chat (nhập vai) <small>— cũng là model viết prompt ảnh, nên chọn model gọi được công cụ (function calling)</small><select data-setting="provider.chat" class="provider-select"></select></label>
           <label>Tóm tắt & tạo nhân vật <small>(để trống = dùng model chat; nên chọn model rẻ)</small><select data-setting="provider.summarize" class="provider-select" data-empty="1"></select></label>
           <label>Đọc truyện tranh (vision)<select data-setting="provider.vision" class="provider-select" data-empty="1"></select></label>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>🖼 Tạo ảnh minh hoạ</h2><button id="new-image-provider">+ Thêm provider ảnh</button></div>
+          <p class="muted small">Bấm <b>🖼 Tạo ảnh</b> ở bất kỳ tin nhắn nào (rê chuột vào tin nhắn) để vẽ phân cảnh đó:</p>
+          <ol class="flow muted small">
+            <li><b>Model chat</b> (ở trên) đọc đoạn hội thoại tới tin đó, tự tra truyện nếu cần → viết prompt chi tiết (ngoại hình, tư thế, bối cảnh, ánh sáng, góc máy) và liệt kê nhân vật trong khung hình.</li>
+            <li><b>App</b> gắn ảnh tham chiếu: ảnh thẻ nhân vật, trang truyện có nhân vật đó, trang model chỉ định, ảnh minh hoạ trước.</li>
+            <li><b>Provider ảnh</b> (dưới đây) vẽ theo prompt + ảnh tham chiếu → ảnh hiện trong cuộc trò chuyện.</li>
+          </ol>
+          <div id="image-provider-list"></div>
+          <label>Provider ảnh đang dùng <small>(chưa chọn = không có nút Tạo ảnh, không bao giờ vẽ)</small><select data-setting="provider.image" class="image-provider-select"></select></label>
+          <label class="check"><input data-setting="image.auto" type="checkbox"> Cho model <b>tự vẽ</b> trong lúc trả lời khi thấy khoảnh khắc đáng vẽ (tool generate_image, tối đa 1 ảnh/câu trả lời). Tắt thì chỉ vẽ khi bạn bấm 🖼 Tạo ảnh.</label>
+          <div class="row2">
+            <label>Phong cách vẽ <small>(thêm vào mọi prompt, để trống = theo truyện)</small><input data-setting="image.style" placeholder="Vd: manga đen trắng, anime cel-shading…"></label>
+            <label>Số ảnh tham chiếu tối đa mỗi lần vẽ<input data-setting="image.max_refs" type="number" min="0" max="8"></label>
+          </div>
         </div>
         <div class="card">
           <h2>RAG & bộ nhớ</h2>
@@ -138,7 +153,7 @@
           <p class="muted small" id="log-dir"></p>
           <p class="muted small">Mỗi ngày một file: <b>app-…log</b> ghi các hoạt động trong app, <b>model-…log</b> ghi từng lần gọi model (mục đích, model, thời gian, nội dung trả về). Log cũ hơn 14 ngày tự xoá. API key không bao giờ được ghi.</p>
         </div>
-        <div class="actions"><button class="primary" id="save-settings">Lưu cài đặt</button></div>
+        <div class="actions"><span class="muted small">Mọi thay đổi được lưu ngay khi bạn chọn hoặc rời ô nhập.</span><button class="primary" id="save-settings">Lưu tất cả</button></div>
       </div>
     </section>
 
@@ -163,6 +178,7 @@
           <form id="composer" class="composer">
             <div class="composer-box">
               <textarea id="input" rows="1" placeholder="Nhắn tin…"></textarea>
+              <button type="button" id="draw-scene" class="round ghost" title="Tạo ảnh phân cảnh hiện tại (tin nhắn mới nhất)">🖼</button>
               <button type="button" id="stop" class="round ghost" title="Dừng" hidden>
                 <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg></button>
               <button type="submit" id="send" class="round" title="Gửi">

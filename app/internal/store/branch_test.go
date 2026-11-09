@@ -59,3 +59,19 @@ func TestRollBackAndBranch(t *testing.T) {
 		t.Errorf("divergence should be empty: %+v", got)
 	}
 }
+
+func TestProviderPurpose(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	p := Provider{Name: "ComfyUI", Kind: "local", ImageAPI: "comfyui", Workflow: `{"1":{}}`, Purpose: PurposeImage}
+	if err := st.SaveProvider(&p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Provider(p.ID)
+	if err != nil || got.Purpose != PurposeImage || got.Workflow != `{"1":{}}` || got.ImageAPI != "comfyui" {
+		t.Errorf("%+v %v", got, err)
+	}
+}

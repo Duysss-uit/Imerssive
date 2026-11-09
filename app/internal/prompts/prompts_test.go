@@ -44,7 +44,7 @@ func TestDefaultPlaceholders(t *testing.T) {
 	want := map[string][]string{
 		"chapter":      {"title", "chapter", "part", "parts", "pages", "story_so_far", "known", "notes", "text"},
 		"entity-merge": {"name", "type", "title", "notes"}, "vision": {"page", "title"},
-		"chat-divergence": {"other", "player", "canon", "log", "excerpt"}, "chat-lore": nil, "chat-reminder": nil, "chat-continue": nil,
+		"chat-divergence": {"other", "player", "canon", "log", "excerpt"}, "chat-lore": nil, "chat-reminder": nil, "chat-continue": nil, "chat-images": nil, "image-prompt": {"excerpt", "profiles", "player", "pictures"},
 		"character-card": {"name", "hint"}, "scenario": {"hint"}, "cast": {"title", "setting"},
 		"research-tools": {"brief", "max"}, "research-plan": {"task", "brief", "max"},
 		"research-knowledge": {"brief", "knowledge"}, "chat-memory": {"other", "player", "excerpt"},

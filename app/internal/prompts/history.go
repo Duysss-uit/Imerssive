@@ -8,6 +8,7 @@ package prompts
 // When changing a default, add the hash of the version being replaced here
 // (sha256sum defaults/<name>.md before the change).
 var previous = map[string][]string{
+	"image-prompt":      {"7edb7a5cfd37306d164d0583521b56c2e24ddbc6da012d0f5a4500324f53e463"},
 	"chat-lore":         {"65e5bf6d8796e383a58079a0425113faccffc83aad6b6c226ba48a77c7d018b2"},
 	"chat-reminder":     {"8fcaaa8e824dff91c7c04564490463a308572bdabd4836e3648a1b53b28c1b99"},
 	"chat-character":    {"bd533d60567819e149a838043bf3b369bb94b197e00bb36a32c30db4eca25578", "7d7b66b9ad5f93ca954c8d4d5530de4d9c0c4a3c82f8630bd10a20a9531d9e79", "e1f9bd9a1f9c24f7251aa4b3daf19c3449f57258e3e119890f1912d09734d100"},
